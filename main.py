@@ -47,9 +47,12 @@ app = FastAPI(
 ALLOWED_ORIGINS = [
     "https://calculatricepro.com",
     "https://www.calculatricepro.com",
-    # Décommentez pour les tests en local pendant la Phase 2 :
-    # "http://127.0.0.1:5500",
-    # "http://localhost:5500",
+    "http://calculatricepro.com",
+    "http://www.calculatricepro.com",
+    "null",  # local file:/// testing
+    "http://127.0.0.1:5500",
+    "http://localhost:5500",
+    "http://localhost:8080",
 ]
 
 app.add_middleware(
