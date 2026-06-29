@@ -76,6 +76,8 @@ class SolveResponse(BaseModel):
     results: List[Result]
     note: Optional[str] = None
     plot: Optional[Dict[str, Any]] = None   # { "fn": "x^2", "points": [[x,y]...] } pour le graphique
+    detected_category: Optional[str] = None # catégorie détectée automatiquement
+    detected_label: Optional[str] = None    # libellé FR de la catégorie détectée
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -1021,6 +1023,148 @@ DISPATCH = {
     "primefactor": solve_primefactor,
 }
 
+# Labels FR pour l'affichage de la catégorie détectée
+CAT_LABELS = {
+    "algebra": "Algèbre", "fraction": "Fractions", "derivative": "Dérivées",
+    "integral": "Intégrales", "statistics": "Statistiques", "trigonometry": "Trigonométrie",
+    "matrix": "Matrices", "basic": "Maths de base", "system": "Systèmes d'équations",
+    "inequality": "Inéquations", "factor": "Factorisation", "expand": "Développement",
+    "limit": "Limites", "logarithm": "Logarithmes", "exponential": "Équations exponentielles",
+    "complex": "Nombres complexes", "sequence": "Suites", "probability": "Probabilités",
+    "polynomial": "Polynômes", "primefactor": "Facteurs premiers",
+}
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  DÉTECTION AUTOMATIQUE DE CATÉGORIE
+#  Analyse l'expression et choisit la meilleure catégorie. Ordre = priorité.
+# ════════════════════════════════════════════════════════════════════════════════
+
+def detect_category(raw: str) -> str:
+    """Détecte la catégorie la plus probable à partir de l'expression saisie."""
+    s = raw.strip()
+    low = s.lower()
+
+    # 1. Matrices : [[...],[...]]
+    if re.search(r'\[\s*\[', s) and re.search(r'\]\s*\]', s):
+        return "matrix"
+
+    # 2. Limites : lim, ->, →, "tend vers"
+    if re.search(r'\blim\b', low) or re.search(r'(->|→)', s) or 'tend vers' in low:
+        return "limit"
+
+    # 3. Systèmes : plusieurs équations (séparées par ; ou "et") avec =
+    eq_parts = [p for p in re.split(r'[;\n]| et ', s) if '=' in p]
+    if len(eq_parts) >= 2:
+        return "system"
+
+    # 4. Inéquations : <, >, <=, >=  (mais pas <- ou ->)
+    if re.search(r'(<=|>=|<|>)', s) and not re.search(r'(->|<-)', s):
+        return "inequality"
+
+    # 5. Combinatoire : C(n,k), A(n,k), nCk, nPk, n!
+    if re.search(r'\b[CA]\s*\(\s*\d+\s*,\s*\d+\s*\)', s) or re.search(r'\d+\s*[CP]\s*\d+', s) or re.fullmatch(r'\s*\d+\s*!\s*', s):
+        return "probability"
+
+    # 6. Nombres complexes : i présent, et pas de variable x/y autre
+    test = re.sub(r'(sin|cos|tan|asin|acos|atan|exp|log|ln|sqrt|pi|abs|arg)', '', low)
+    if re.search(r'(?<![a-z])i(?![a-z])', test) and not re.search(r'[a-hj-z]', test):
+        return "complex"
+
+    has_eq = '=' in s
+
+    # 7. Logarithmes : ln/log dans une équation
+    if has_eq and re.search(r'\b(ln|log)\b', low):
+        return "logarithm"
+
+    # 8. Exponentielles : a^x ou e^x dans une équation
+    if has_eq and re.search(r'(\d+\s*\^\s*x|e\s*\^\s*x|exp\s*\(\s*x)', low):
+        return "exponential"
+
+    # 9. PGCD / PPCM / pourcentage
+    if re.search(r'\b(pgcd|gcd|ppcm|lcm)\b', low) or re.search(r'%\s*(de|of)\b', low):
+        return "basic"
+
+    # 10. Intégrale définie : [a,b] présent  ou symbole ∫
+    if '∫' in s or (re.search(r'\[\s*-?\d', s) and re.search(r',\s*-?\d+\s*\]', s)):
+        return "integral"
+
+    # 11. Trigonométrie : fonctions trig présentes
+    if re.search(r'\b(sin|cos|tan|asin|acos|atan|sec|csc|cot)\s*\(', low):
+        return "trigonometry"
+
+    # 12. Fraction simple : a/b uniquement (entiers)
+    if re.fullmatch(r'\s*-?\d+\s*/\s*-?\d+\s*', s):
+        return "fraction"
+
+    # 13. Suite : liste de >=3 nombres séparés par virgules, sans =, sans variable
+    if not has_eq and re.fullmatch(r'[\d\s,;.\-/]+', s):
+        nums = [p for p in re.split(r'[,;\s]+', s) if p.strip()]
+        if len(nums) >= 3:
+            # statistiques si beaucoup de valeurs (>=5) sinon suite
+            return "statistics" if len(nums) >= 6 else "sequence"
+
+    # 14. Entier seul -> facteurs premiers
+    if re.fullmatch(r'\s*\d+\s*', s) and int(s) >= 2:
+        return "primefactor"
+
+    # 15. Équation avec = : algèbre (gère linéaire/quadratique, redirige vers polynôme si degré>2)
+    if has_eq:
+        return "algebra"
+
+    # 16. Expression sans = avec variable x : on regarde dérivée/intégrale/factorisation
+    if re.search(r'[a-z]', low):
+        # produit de facteurs (x+...)(x+...) -> développement
+        if re.search(r'\)\s*\(', s):
+            return "expand"
+        return "algebra"  # sera traité comme expression, fallback
+
+    # 17. Calcul arithmétique pur
+    return "basic"
+
+
+def smart_solve(raw: str) -> "SolveResponse":
+    """Détecte la catégorie puis résout. Essaie des alternatives si la 1re échoue."""
+    primary = detect_category(raw)
+    tried = []
+
+    # ordre d'essai : catégorie détectée, puis fallbacks raisonnables
+    candidates = [primary]
+    fallback_map = {
+        "algebra": ["polynomial", "basic"],
+        "polynomial": ["algebra"],
+        "basic": ["algebra"],
+        "sequence": ["statistics"],
+        "statistics": ["sequence"],
+        "expand": ["algebra", "factor"],
+        "complex": ["algebra"],
+    }
+    for f in fallback_map.get(primary, []):
+        if f not in candidates:
+            candidates.append(f)
+
+    last_err = None
+    for cat in candidates:
+        fn = DISPATCH.get(cat)
+        if not fn:
+            continue
+        try:
+            resp = fn(raw)
+            resp.detected_category = cat
+            resp.detected_label = CAT_LABELS.get(cat, cat)
+            return resp
+        except HTTPException as e:
+            last_err = e
+            tried.append(cat)
+            continue
+        except Exception as e:
+            last_err = HTTPException(400, f"Erreur ({type(e).__name__})")
+            tried.append(cat)
+            continue
+    # tout a échoué
+    if last_err:
+        raise last_err
+    raise HTTPException(400, "Impossible de reconnaître ce type de problème.")
+
 @app.get("/")
 def root():
     return {"status": "ok", "service": "CalculatricePro API", "version": "3.0.0", "categories": len(DISPATCH)}
@@ -1028,6 +1172,17 @@ def root():
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+
+class DetectRequest(BaseModel):
+    expression: str
+
+@app.post("/api/detect")
+def detect(req: DetectRequest):
+    raw = req.expression.strip()
+    if not raw:
+        return {"category": None, "label": None}
+    cat = detect_category(raw)
+    return {"category": cat, "label": CAT_LABELS.get(cat, cat)}
 
 @app.post("/api/solve", response_model=SolveResponse)
 def solve(req: SolveRequest):
@@ -1037,9 +1192,15 @@ def solve(req: SolveRequest):
     if len(raw) > 500:
         raise HTTPException(400, "Expression trop longue (max 500 caractères).")
     cat = req.category.lower().strip()
+    # Mode détection automatique
+    if cat in ("auto", "", "detect"):
+        return smart_solve(raw)
     fn = DISPATCH.get(cat, solve_algebra)
     try:
-        return fn(raw)
+        resp = fn(raw)
+        resp.detected_category = cat
+        resp.detected_label = CAT_LABELS.get(cat, cat)
+        return resp
     except HTTPException:
         raise
     except ZeroDivisionError:
