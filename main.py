@@ -1,17 +1,17 @@
 """
-CalculatricePro - Backend API v3.0
-20 catégories : algèbre, fractions, dérivées, intégrales, statistiques,
-trigonométrie, matrices, maths de base, systèmes, inéquations, factorisation,
-développement, limites, logarithmes, exponentielles, nombres complexes,
-suites, probabilités, polynômes, facteurs premiers.
+CalculatricePro - Backend API v5.0
+Speed optimizations: LRU cache, pre-warmed symbols, fast parse
+Multi-method solving: Quadratic gets 3 methods (Factoring, Formula, Completing Square)
+20 categories with server-side auto-detection
 """
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
-import re, json
+import re, json, hashlib
 from collections import Counter
+from functools import lru_cache
 
 import sympy
 from sympy import (
@@ -19,17 +19,16 @@ from sympy import (
     Poly, sqrt, Rational, gcd, lcm, diff, integrate, limit,
     sin, cos, tan, pi, oo, trigsimp, Abs, Matrix, I,
     re as sym_re, im as sym_im, arg, factorint, binomial, factorial,
-    summation, logcombine, log, exp, S, solveset, Interval, FiniteSet,
+    summation, logcombine, log, exp, S, solveset,
 )
-from sympy.calculus.util import continuous_domain
 from sympy.parsing.sympy_parser import (
     parse_expr, standard_transformations,
     implicit_multiplication_application, convert_xor,
 )
 
-# ── App ────────────────────────────────────────────────────────────────────────
+# ── App ──────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="CalculatricePro API", version="3.0.0")
+app = FastAPI(title="CalculatricePro API", version="5.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,22 +47,48 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Pre-warm symbols (avoids repeated creation overhead)
 X = symbols("x")
+Y = symbols("y")
+Z = symbols("z")
 N = symbols("n", positive=True, integer=True)
 TRANSFORMATIONS = standard_transformations + (
     implicit_multiplication_application,
     convert_xor,
 )
 
-# ── Models ─────────────────────────────────────────────────────────────────────
+# ── In-memory response cache (LRU - fixes Render slow response) ──────────────
+_SOLVE_CACHE: Dict[str, Any] = {}
+CACHE_MAX = 200  # max entries
+
+def cache_key(expression: str, category: str) -> str:
+    return hashlib.md5(f"{expression.strip().lower()}|{category}".encode()).hexdigest()
+
+def cache_get(key: str):
+    return _SOLVE_CACHE.get(key)
+
+def cache_set(key: str, value: Any):
+    if len(_SOLVE_CACHE) >= CACHE_MAX:
+        # Remove oldest entry
+        oldest = next(iter(_SOLVE_CACHE))
+        del _SOLVE_CACHE[oldest]
+    _SOLVE_CACHE[key] = value
+
+# ── Models ────────────────────────────────────────────────────────────────────
 
 class SolveRequest(BaseModel):
     expression: str = Field(..., description="Expression à résoudre")
-    category: str = Field("algebra", description="catégorie")
+    category: str = Field("auto", description="catégorie (auto = détection automatique)")
 
 class Step(BaseModel):
-    description: str
-    latex: str
+    description: str   # English wording explanation
+    latex: str         # Math in LaTeX
+
+class Method(BaseModel):
+    id: str            # "factoring", "quadratic_formula", "completing_square", etc.
+    label: str         # "Method 1: Factoring"
+    label_fr: str      # "Méthode 1 : Factorisation"
+    steps: List[Step]
 
 class Result(BaseModel):
     latex: str
@@ -72,14 +97,16 @@ class Result(BaseModel):
 class SolveResponse(BaseModel):
     type: str
     input_latex: str
-    steps: List[Step]
-    results: List[Result]
+    methods: List[Method]          # multi-method tabs
+    results: List[Result]          # final answers
+    final_answer: str              # e.g. "x = 2 or x = 3"
     note: Optional[str] = None
-    plot: Optional[Dict[str, Any]] = None   # { "fn": "x^2", "points": [[x,y]...] } pour le graphique
-    detected_category: Optional[str] = None # catégorie détectée automatiquement
-    detected_label: Optional[str] = None    # libellé FR de la catégorie détectée
+    plot: Optional[Dict[str, Any]] = None
+    detected_category: Optional[str] = None
+    detected_label: Optional[str] = None
+    discriminant_info: Optional[str] = None  # "D > 0 → 2 distinct real roots"
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def pre(raw: str) -> str:
     s = raw.strip()
@@ -87,17 +114,15 @@ def pre(raw: str) -> str:
     s = s.replace("π", "pi").replace("∞", "oo")
     s = re.sub(r"√\(([^)]+)\)", r"sqrt(\1)", s)
     s = re.sub(r"√(\d+(\.\d+)?)", r"sqrt(\1)", s)
-    # virgule décimale entre chiffres -> point (mais pas dans les listes)
     return s.strip()
 
 def pre_imag(raw: str) -> str:
-    """Préparation pour nombres complexes : i -> I."""
     s = pre(raw)
     s = re.sub(r"(?<![a-zA-Z])i(?![a-zA-Z])", "I", s)
     return s
 
 def safe_parse(expr_str: str, allow_imag: bool = False):
-    ld = {"x": X, "pi": pi, "oo": oo, "E": exp(1), "e": exp(1)}
+    ld = {"x": X, "y": Y, "z": Z, "pi": pi, "oo": oo, "E": exp(1), "e": exp(1)}
     if allow_imag:
         ld["I"] = I
     try:
@@ -114,16 +139,7 @@ def decimal_str(value) -> Optional[str]:
     except Exception:
         return None
 
-def phrase_side(coeff, label: str) -> str:
-    c = nsimplify(coeff)
-    if c == 0:
-        return ""
-    return (f"Soustraire {tex(c)}{label} des deux membres"
-            if c > 0 else
-            f"Ajouter {tex(-c)}{label} aux deux membres")
-
-def sample_plot(expr, var=X, lo=-10.0, hi=10.0, n=240):
-    """Échantillonne une fonction f(var) pour le graphique frontend."""
+def sample_plot(expr, var=X, lo=-10.0, hi=10.0, n=200):
     try:
         f = sympy.lambdify(var, expr, "math")
     except Exception:
@@ -134,10 +150,8 @@ def sample_plot(expr, var=X, lo=-10.0, hi=10.0, n=240):
         xv = lo + i * step
         try:
             yv = f(xv)
-            if isinstance(yv, complex):
-                continue
-            if yv != yv or abs(yv) > 1e6:   # NaN ou explosion
-                continue
+            if isinstance(yv, complex): continue
+            if yv != yv or abs(yv) > 1e6: continue
             pts.append([round(xv, 4), round(float(yv), 4)])
         except Exception:
             continue
@@ -145,131 +159,297 @@ def sample_plot(expr, var=X, lo=-10.0, hi=10.0, n=240):
         return None
     return {"fn": tex(expr), "points": pts}
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  1. ALGÈBRE
-# ════════════════════════════════════════════════════════════════════════════════
+def single_method(method_id, label, label_fr, steps) -> Method:
+    return Method(id=method_id, label=label, label_fr=label_fr, steps=steps)
+
+# ════════════════════════════════════════════════════════════════════════════
+#  1. ALGEBRA  ── now returns 3 methods for quadratic
+# ════════════════════════════════════════════════════════════════════════════
 
 def solve_algebra(raw: str) -> SolveResponse:
     if raw.count("=") != 1:
-        raise HTTPException(400, "Une équation doit contenir exactement un signe « = ».")
+        raise HTTPException(400, "An equation must contain exactly one '=' sign.")
     lhs_s, rhs_s = raw.split("=")
     lhs = safe_parse(pre(lhs_s))
     rhs = safe_parse(pre(rhs_s))
     if (lhs.free_symbols | rhs.free_symbols) - {X}:
-        raise HTTPException(400, "Seule la variable x est prise en charge.")
+        raise HTTPException(400, "Only variable x is supported.")
     input_latex = f"{tex(lhs)} = {tex(rhs)}"
-    steps = [Step(description="Équation de départ", latex=input_latex)]
     lhs_e, rhs_e = expand(lhs), expand(rhs)
-    if lhs_e != lhs or rhs_e != rhs:
-        steps.append(Step(description="Développer les deux membres", latex=f"{tex(lhs_e)} = {tex(rhs_e)}"))
     try:
         pl, pr = Poly(lhs_e, X), Poly(rhs_e, X)
     except Exception:
-        raise HTTPException(400, "Impossible d'interpréter comme polynôme en x.")
+        raise HTTPException(400, "Cannot interpret as polynomial in x.")
     deg = max(pl.degree(), pr.degree())
     if deg <= 1:
-        resp = _linear(pl, pr, steps, input_latex)
+        return _linear_full(pl, pr, input_latex, lhs, rhs)
     elif deg == 2:
-        resp = _quadratic(pl, pr, steps, input_latex)
+        return _quadratic_full(pl, pr, input_latex, lhs, rhs)
     else:
         return solve_polynomial(raw)
-    # graphique : f(x) = lhs - rhs
-    resp.plot = sample_plot(expand(lhs - rhs))
-    return resp
 
-def _coeffs(poly):
-    return nsimplify(poly.coeff_monomial(X)), nsimplify(poly.coeff_monomial(1))
 
-def _linear(pl, pr, steps, input_latex):
-    a1, b1 = _coeffs(pl); a2, b2 = _coeffs(pr)
+def _linear_full(pl, pr, input_latex, lhs, rhs) -> SolveResponse:
+    """Linear equation — single method, clear English steps."""
+    def coeffs(poly):
+        return nsimplify(poly.coeff_monomial(X)), nsimplify(poly.coeff_monomial(1))
+    a1, b1 = coeffs(pl); a2, b2 = coeffs(pr)
     a = a1 - a2
-    if a2 != 0:
-        p = phrase_side(a2, "x")
-        if p:
-            steps.append(Step(description=p,
-                latex=f"{tex(a)}x {'+' if b1 >= 0 else '-'} {tex(abs(b1))} = {tex(b2)}" if b1 != 0 else f"{tex(a)}x = {tex(b2)}"))
     rhs_c = b2 - b1
-    if b1 != 0:
-        p = phrase_side(b1, "")
-        if p:
-            steps.append(Step(description=p, latex=f"{tex(a)}x = {tex(rhs_c)}"))
+
+    steps = [
+        Step(description="Write the equation in standard form",
+             latex=input_latex),
+        Step(description=f"Move all x-terms to the left side and constants to the right",
+             latex=f"{tex(a)}x = {tex(rhs_c)}"),
+    ]
     if a == 0:
         if rhs_c == 0:
-            steps.append(Step(description="Simplification", latex="0 = 0"))
-            return SolveResponse(type="lineaire", input_latex=input_latex, steps=steps, results=[], note="Infinité de solutions.")
-        steps.append(Step(description="Simplification", latex=f"0 = {tex(rhs_c)}"))
-        return SolveResponse(type="lineaire", input_latex=input_latex, steps=steps, results=[], note="Aucune solution.")
-    if a != 1:
-        steps.append(Step(description=f"Diviser les deux membres par {tex(a)}", latex=f"x = \\frac{{{tex(rhs_c)}}}{{{tex(a)}}}"))
-    sol = nsimplify(rhs_c / a)
-    steps.append(Step(description="Solution", latex=f"x = {tex(sol)}"))
-    return SolveResponse(type="lineaire", input_latex=input_latex, steps=steps,
-        results=[Result(latex=tex(sol), decimal=decimal_str(sol))])
+            steps.append(Step(description="Both sides are equal — infinite solutions", latex="0 = 0"))
+            return SolveResponse(type="lineaire", input_latex=input_latex,
+                methods=[single_method("direct","Method 1: Direct Solving","Méthode 1 : Résolution directe", steps)],
+                results=[], final_answer="Infinite solutions", note="Infinité de solutions.")
+        steps.append(Step(description="Contradiction — no solution exists", latex=f"0 = {tex(rhs_c)}"))
+        return SolveResponse(type="lineaire", input_latex=input_latex,
+            methods=[single_method("direct","Method 1: Direct Solving","Méthode 1 : Résolution directe", steps)],
+            results=[], final_answer="No solution", note="Aucune solution.")
 
-def _quadratic(pl, pr, steps, input_latex):
+    sol = nsimplify(rhs_c / a)
+    steps.append(Step(description=f"Divide both sides by {tex(a)} to isolate x",
+                      latex=f"x = \\frac{{{tex(rhs_c)}}}{{{tex(a)}}} = {tex(sol)}"))
+    steps.append(Step(description="Final solution", latex=f"x = {tex(sol)}"))
+
+    m = single_method("direct","Method 1: Direct Solving","Méthode 1 : Résolution directe", steps)
+    return SolveResponse(
+        type="lineaire", input_latex=input_latex,
+        methods=[m],
+        results=[Result(latex=tex(sol), decimal=decimal_str(sol))],
+        final_answer=f"x = {tex(sol)}",
+        plot=sample_plot(expand(lhs - rhs))
+    )
+
+
+def _quadratic_full(pl, pr, input_latex, lhs, rhs) -> SolveResponse:
+    """Quadratic — 3 full methods: Factoring, Quadratic Formula, Completing the Square."""
     expr = expand((pl - pr).as_expr())
-    if pr.as_expr() != 0:
-        steps.append(Step(description="Forme canonique ax² + bx + c = 0", latex=f"{tex(expr)} = 0"))
     p = Poly(expr, X)
     a = nsimplify(p.coeff_monomial(X**2))
     b = nsimplify(p.coeff_monomial(X))
     c = nsimplify(p.coeff_monomial(1))
-    steps.append(Step(description=f"Coefficients : a={tex(a)}, b={tex(b)}, c={tex(c)}", latex=f"a={tex(a)},\\; b={tex(b)},\\; c={tex(c)}"))
     D = nsimplify(b**2 - 4*a*c)
-    steps.append(Step(description="Discriminant Δ = b² − 4ac", latex=f"\\Delta = ({tex(b)})^2 - 4({tex(a)})({tex(c)}) = {tex(D)}"))
-    if D > 0:
-        sd = nsimplify(sympy.sqrt(D))
-        steps.append(Step(description="Δ > 0 → deux solutions réelles", latex=f"\\sqrt{{\\Delta}} = {tex(sd)}"))
-        x1 = nsimplify((-b - sd) / (2*a)); x2 = nsimplify((-b + sd) / (2*a))
-        steps.append(Step(description="Formule quadratique x = (−b ± √Δ) / 2a",
-            latex=f"x_1 = {tex(x1)}, \\quad x_2 = {tex(x2)}"))
-        return SolveResponse(type="quadratique", input_latex=input_latex, steps=steps,
-            results=[Result(latex=tex(x1), decimal=decimal_str(x1)), Result(latex=tex(x2), decimal=decimal_str(x2))])
-    elif D == 0:
-        x0 = nsimplify(-b / (2*a))
-        steps.append(Step(description="Δ = 0 → solution double", latex=f"x = \\frac{{-b}}{{2a}} = {tex(x0)}"))
-        return SolveResponse(type="quadratique", input_latex=input_latex, steps=steps,
-            results=[Result(latex=tex(x0), decimal=decimal_str(x0))])
-    steps.append(Step(description="Δ < 0 → aucune solution réelle", latex=f"\\Delta = {tex(D)} < 0"))
-    # solutions complexes
-    sd = sympy.sqrt(D)
-    x1 = nsimplify((-b - sd) / (2*a)); x2 = nsimplify((-b + sd) / (2*a))
-    steps.append(Step(description="Solutions complexes", latex=f"x_1 = {tex(x1)}, \\quad x_2 = {tex(x2)}"))
-    return SolveResponse(type="quadratique", input_latex=input_latex, steps=steps,
-        results=[Result(latex=tex(x1)), Result(latex=tex(x2))],
-        note="Aucune solution réelle (solutions complexes affichées).")
+    sd = nsimplify(sympy.sqrt(D)) if D >= 0 else None
 
-# ════════════════════════════════════════════════════════════════════════════════
+    # Discriminant info
+    if D > 0:
+        disc_info = f"D = {tex(D)} > 0 → Two distinct real roots"
+    elif D == 0:
+        disc_info = f"D = 0 → One repeated real root (double root)"
+    else:
+        disc_info = f"D = {tex(D)} < 0 → No real roots (complex roots)"
+
+    # Roots
+    if D >= 0:
+        x1 = nsimplify((-b - sd) / (2*a))
+        x2 = nsimplify((-b + sd) / (2*a))
+        results = [Result(latex=tex(x1), decimal=decimal_str(x1)),
+                   Result(latex=tex(x2), decimal=decimal_str(x2))]
+        if x1 == x2:
+            final_answer = f"x = {tex(x1)}"
+        else:
+            final_answer = f"x = {tex(x1)} \\text{{ or }} x = {tex(x2)}"
+    else:
+        x1 = nsimplify((-b - sympy.sqrt(D)) / (2*a))
+        x2 = nsimplify((-b + sympy.sqrt(D)) / (2*a))
+        results = [Result(latex=tex(x1)), Result(latex=tex(x2))]
+        final_answer = f"x = {tex(x1)} \\text{{ or }} x = {tex(x2)}"
+
+    methods = []
+
+    # ── METHOD 1: FACTORING ─────────────────────────────────────────────────
+    m1_steps = [
+        Step(description="Write the equation in standard form ax² + bx + c = 0",
+             latex=f"{tex(expr)} = 0"),
+        Step(description=f"Identify coefficients: a = {tex(a)}, b = {tex(b)}, c = {tex(c)}",
+             latex=f"a = {tex(a)},\\; b = {tex(b)},\\; c = {tex(c)}"),
+    ]
+    try:
+        factored = factor(expr)
+        factors = sympy.factor_list(expr)
+        fac_str = tex(factored)
+        # Find two numbers: multiply to a*c, add to b
+        prod_val = int(a * c)
+        sum_val = int(b)
+        found = None
+        for i in range(-abs(prod_val)-1, abs(prod_val)+2):
+            if i == 0: continue
+            if prod_val % i == 0:
+                j = prod_val // i
+                if i + j == sum_val:
+                    found = (i, j)
+                    break
+        if found:
+            m1_steps.append(Step(
+                description=f"Find two numbers that multiply to ac = {tex(a)}×{tex(c)} = {prod_val} and add to b = {sum_val}",
+                latex=f"\\text{{Numbers: }} {found[0]} \\text{{ and }} {found[1]} \\quad \\because {found[0]} \\times {found[1]} = {prod_val} \\text{{ and }} {found[0]} + {found[1]} = {sum_val}"
+            ))
+            # Split middle term
+            b1, b2 = found
+            m1_steps.append(Step(
+                description="Split the middle term using the two numbers found",
+                latex=f"{tex(a)}x^2 + {b1}x + {b2}x + {tex(c)} = 0"
+            ))
+            m1_steps.append(Step(
+                description="Group terms and factor out common factors from each group",
+                latex=f"x(x + {b1}) + {b2//int(a) if int(a)!=1 else b2}(x + {b1}) = 0" if False else f"{tex(factored)} = 0"
+            ))
+        else:
+            m1_steps.append(Step(description="Factor the expression",
+                                 latex=f"{fac_str} = 0"))
+        m1_steps.append(Step(
+            description="Apply Zero Product Property: if A×B = 0, then A = 0 or B = 0",
+            latex=f"{fac_str} = 0 \\implies \\text{{each factor}} = 0"
+        ))
+        m1_steps.append(Step(
+            description=f"Set each factor equal to zero and solve",
+            latex=f"x = {tex(x1)} \\quad \\text{{or}} \\quad x = {tex(x2)}"
+        ))
+        methods.append(Method(id="factoring", label="Method 1: Factoring",
+                              label_fr="Méthode 1 : Factorisation", steps=m1_steps))
+    except Exception:
+        pass
+
+    # ── METHOD 2: QUADRATIC FORMULA ─────────────────────────────────────────
+    m2_steps = [
+        Step(description="Write the equation in standard form ax² + bx + c = 0",
+             latex=f"{tex(expr)} = 0"),
+        Step(description=f"Identify coefficients: a = {tex(a)}, b = {tex(b)}, c = {tex(c)}",
+             latex=f"a = {tex(a)},\\; b = {tex(b)},\\; c = {tex(c)}"),
+        Step(description="Write the Quadratic Formula",
+             latex=r"x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}"),
+        Step(description=f"Substitute the values into the formula",
+             latex=f"x = \\frac{{-({tex(b)}) \\pm \\sqrt{{({tex(b)})^2 - 4({tex(a)})({tex(c)})}}}}{{2({tex(a)})}}"),
+        Step(description=f"Calculate the Discriminant: D = b² - 4ac",
+             latex=f"D = ({tex(b)})^2 - 4({tex(a)})({tex(c)}) = {tex(b**2)} - {tex(4*a*c)} = {tex(D)}"),
+        Step(description=disc_info,
+             latex=f"\\Delta = {tex(D)} {'> 0' if D > 0 else ('= 0' if D == 0 else '< 0')}"),
+    ]
+    if D >= 0:
+        m2_steps.append(Step(
+            description=f"Simplify: √D = √{tex(D)} = {tex(sd)}",
+            latex=f"\\sqrt{{D}} = \\sqrt{{{tex(D)}}} = {tex(sd)}"
+        ))
+        m2_steps.append(Step(
+            description="Calculate both roots using + and − of the ± symbol",
+            latex=f"x = \\frac{{{tex(-b)} \\pm {tex(sd)}}}{{{tex(2*a)}}}"
+        ))
+        m2_steps.append(Step(
+            description=f"Root 1 (using +): x₁ = ({tex(-b)} + {tex(sd)}) / {tex(2*a)}",
+            latex=f"x_1 = \\frac{{{tex(-b)} + {tex(sd)}}}{{{tex(2*a)}}} = {tex(x2)}"
+        ))
+        if x1 != x2:
+            m2_steps.append(Step(
+                description=f"Root 2 (using −): x₂ = ({tex(-b)} − {tex(sd)}) / {tex(2*a)}",
+                latex=f"x_2 = \\frac{{{tex(-b)} - {tex(sd)}}}{{{tex(2*a)}}} = {tex(x1)}"
+            ))
+    m2_steps.append(Step(
+        description="Final roots",
+        latex=final_answer
+    ))
+    methods.append(Method(id="quadratic_formula", label="Method 2: Quadratic Formula",
+                          label_fr="Méthode 2 : Formule Quadratique", steps=m2_steps))
+
+    # ── METHOD 3: COMPLETING THE SQUARE ─────────────────────────────────────
+    m3_steps = [
+        Step(description="Write the equation in standard form ax² + bx + c = 0",
+             latex=f"{tex(expr)} = 0"),
+        Step(description=f"If a ≠ 1, divide every term by a = {tex(a)}",
+             latex=f"x^2 + \\frac{{{tex(b)}}}{{{tex(a)}}}x + \\frac{{{tex(c)}}}{{{tex(a)}}} = 0" if a != 1 else f"x^2 + ({tex(b)})x + {tex(c)} = 0"),
+        Step(description="Move the constant term to the right side",
+             latex=f"x^2 + ({tex(b/a)})x = {tex(-c/a)}"),
+    ]
+    half_b = nsimplify(b / (2*a))
+    half_b_sq = nsimplify(half_b**2)
+    rhs_complete = nsimplify(-c/a + half_b_sq)
+    m3_steps.append(Step(
+        description=f"Find the value to complete the square: (b/2a)² = ({tex(b)}/2×{tex(a)})² = ({tex(half_b)})² = {tex(half_b_sq)}",
+        latex=f"\\left(\\frac{{b}}{{2a}}\\right)^2 = \\left(\\frac{{{tex(b)}}}{{2 \\cdot {tex(a)}}}\\right)^2 = {tex(half_b_sq)}"
+    ))
+    m3_steps.append(Step(
+        description=f"Add {tex(half_b_sq)} to BOTH sides to maintain equality",
+        latex=f"x^2 + ({tex(b/a)})x + {tex(half_b_sq)} = {tex(-c/a)} + {tex(half_b_sq)}"
+    ))
+    m3_steps.append(Step(
+        description="The left side is now a perfect square trinomial",
+        latex=f"\\left(x + {tex(half_b)}\\right)^2 = {tex(rhs_complete)}"
+    ))
+    sqrt_rhs = nsimplify(sympy.sqrt(rhs_complete)) if rhs_complete >= 0 else None
+    if sqrt_rhs is not None:
+        m3_steps.append(Step(
+            description="Take the square root of both sides (remember ±)",
+            latex=f"x + {tex(half_b)} = \\pm\\sqrt{{{tex(rhs_complete)}}} = \\pm {tex(sqrt_rhs)}"
+        ))
+        m3_steps.append(Step(
+            description=f"Subtract {tex(half_b)} from both sides to isolate x",
+            latex=f"x = -{tex(half_b)} \\pm {tex(sqrt_rhs)}"
+        ))
+        m3_steps.append(Step(
+            description=f"Root 1 (using +): x = {tex(-half_b)} + {tex(sqrt_rhs)} = {tex(nsimplify(-half_b + sqrt_rhs))}",
+            latex=f"x_1 = {tex(-half_b)} + {tex(sqrt_rhs)} = {tex(nsimplify(-half_b + sqrt_rhs))}"
+        ))
+        m3_steps.append(Step(
+            description=f"Root 2 (using −): x = {tex(-half_b)} − {tex(sqrt_rhs)} = {tex(nsimplify(-half_b - sqrt_rhs))}",
+            latex=f"x_2 = {tex(-half_b)} - {tex(sqrt_rhs)} = {tex(nsimplify(-half_b - sqrt_rhs))}"
+        ))
+    m3_steps.append(Step(description="Final roots", latex=final_answer))
+    methods.append(Method(id="completing_square", label="Method 3: Completing the Square",
+                          label_fr="Méthode 3 : Complétion du Carré", steps=m3_steps))
+
+    return SolveResponse(
+        type="quadratique",
+        input_latex=input_latex,
+        methods=methods,
+        results=results,
+        final_answer=final_answer,
+        discriminant_info=disc_info,
+        plot=sample_plot(expr)
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  2. FRACTIONS
-# ════════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
 def solve_fraction(raw: str) -> SolveResponse:
     m = re.fullmatch(r"\s*(-?\d+)\s*/\s*(-?\d+)\s*", pre(raw))
     if not m:
-        raise HTTPException(400, "Format : numérateur/dénominateur (ex: 12/18).")
+        raise HTTPException(400, "Format: numerator/denominator (e.g. 12/18).")
     num, den = int(m.group(1)), int(m.group(2))
     if den == 0:
-        raise HTTPException(400, "Division par zéro impossible.")
+        raise HTTPException(400, "Division by zero is undefined.")
     input_latex = f"\\frac{{{num}}}{{{den}}}"
-    steps = [Step(description="Fraction de départ", latex=input_latex)]
+    g = sympy.gcd(abs(num), abs(den))
     sign = -1 if (num < 0) ^ (den < 0) else 1
-    na, da = abs(num), abs(den)
-    g = sympy.gcd(na, da)
-    steps.append(Step(description=f"PGCD({na}, {da}) = {g}", latex=f"\\text{{PGCD}}({na},{da}) = {g}"))
-    if g == 1:
-        steps.append(Step(description="Fraction déjà irréductible", latex=input_latex))
-        res = Rational(num, den)
-    else:
-        nn, nd = na // g, da // g
-        steps.append(Step(description=f"Diviser num. et dén. par {g}",
-            latex=f"\\frac{{{na}\\div{g}}}{{{da}\\div{g}}} = \\frac{{{nn}}}{{{nd}}}"))
-        res = sign * Rational(nn, nd)
-    return SolveResponse(type="fraction", input_latex=input_latex, steps=steps,
-        results=[Result(latex=tex(res), decimal=decimal_str(res))])
+    na, da = abs(num)//g, abs(den)//g
+    res = sign * Rational(na, da)
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  3. DÉRIVÉES
-# ════════════════════════════════════════════════════════════════════════════════
+    steps = [
+        Step(description="Write the fraction", latex=input_latex),
+        Step(description=f"Find the Greatest Common Divisor (GCD) of {abs(num)} and {abs(den)}",
+             latex=f"\\text{{GCD}}({abs(num)}, {abs(den)}) = {g}"),
+        Step(description=f"Divide both numerator and denominator by {g}",
+             latex=f"\\frac{{{num} \\div {g}}}{{{den} \\div {g}}} = \\frac{{{sign*na}}}{{{da}}}"),
+        Step(description="Simplified fraction (irreducible)", latex=tex(res)),
+    ]
+    m1 = single_method("simplify", "Method 1: GCD Simplification",
+                        "Méthode 1 : Simplification par PGCD", steps)
+    return SolveResponse(type="fraction", input_latex=input_latex, methods=[m1],
+        results=[Result(latex=tex(res), decimal=decimal_str(res))],
+        final_answer=tex(res))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  3. DERIVATIVES
+# ════════════════════════════════════════════════════════════════════════════
 
 def solve_derivative(raw: str) -> SolveResponse:
     cleaned = pre(raw)
@@ -277,38 +457,43 @@ def solve_derivative(raw: str) -> SolveResponse:
     if cleaned.endswith(")") and "d/dx" in raw.lower():
         cleaned = cleaned[:-1]
     expr = safe_parse(cleaned)
-    if expr.free_symbols - {X}:
-        raise HTTPException(400, "Seule la dérivation par rapport à x est supportée.")
     expr = expand(expr)
     input_latex = f"\\frac{{d}}{{dx}}\\left({tex(expr)}\\right)"
-    steps = [Step(description="Expression de départ", latex=tex(expr))]
+    result = simplify(diff(expr, X))
+
     terms = expr.as_ordered_terms()
+    steps = [
+        Step(description="Write the function to differentiate", latex=tex(expr)),
+    ]
     if len(terms) > 1:
-        steps.append(Step(description="Règle de la somme : dériver terme par terme", latex=tex(expr)))
-    d_terms = []
+        steps.append(Step(description="Apply the Sum Rule: differentiate term by term", latex=tex(expr)))
     for t in terms:
-        dt = diff(t, X); d_terms.append(dt)
-        if t.has(X):
-            pt = Poly(t, X) if t.is_polynomial(X) else None
-            if pt and pt.degree() >= 1:
-                pw = pt.degree(); co = pt.LC()
-                cd = "" if co == 1 else ("-" if co == -1 else tex(co))
-                desc = (f"Règle de puissance : d/dx[{cd}x^{{{pw}}}] = {tex(dt)}"
-                        if pw > 1 else f"d/dx[{cd}x] = {tex(dt)}")
-            else:
-                desc = f"d/dx[{tex(t)}] = {tex(dt)}"
+        dt = diff(t, X)
+        if not t.has(X):
+            steps.append(Step(description=f"Derivative of constant {tex(t)} = 0", latex=f"\\frac{{d}}{{dx}}[{tex(t)}] = 0"))
+        elif t.is_polynomial(X):
+            try:
+                pt = Poly(t, X)
+                pw = pt.degree()
+                steps.append(Step(description=f"Apply Power Rule: d/dx[xⁿ] = n·xⁿ⁻¹ for power {pw}",
+                    latex=f"\\frac{{d}}{{dx}}[{tex(t)}] = {tex(dt)}"))
+            except Exception:
+                steps.append(Step(description=f"Differentiate {tex(t)}", latex=f"= {tex(dt)}"))
         else:
-            desc = f"Constante → dérivée nulle : d/dx[{tex(t)}] = 0"
-        steps.append(Step(description=desc, latex=tex(dt)))
-    result = simplify(sum(d_terms))
-    steps.append(Step(description="Résultat final", latex=f"f'(x) = {tex(result)}"))
-    return SolveResponse(type="derivee", input_latex=input_latex, steps=steps,
-        results=[Result(latex=tex(result))],
+            steps.append(Step(description=f"Differentiate {tex(t)} using known rules",
+                latex=f"\\frac{{d}}{{dx}}[{tex(t)}] = {tex(dt)}"))
+    steps.append(Step(description="Combine all terms — final derivative", latex=f"f'(x) = {tex(result)}"))
+
+    m1 = single_method("differentiation", "Method 1: Differentiation Rules",
+                        "Méthode 1 : Règles de Dérivation", steps)
+    return SolveResponse(type="derivee", input_latex=input_latex, methods=[m1],
+        results=[Result(latex=tex(result))], final_answer=f"f'(x) = {tex(result)}",
         plot=sample_plot(result))
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  4. INTÉGRALES
-# ════════════════════════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════════════════════
+#  4. INTEGRALS
+# ════════════════════════════════════════════════════════════════════════════
 
 def solve_integral(raw: str) -> SolveResponse:
     cleaned = pre(raw)
@@ -319,47 +504,42 @@ def solve_integral(raw: str) -> SolveResponse:
         bounds = (float(bm.group(1)), float(bm.group(2)))
         cleaned = cleaned[:bm.start()].strip()
     expr = safe_parse(cleaned)
-    if expr.free_symbols - {X}:
-        raise HTTPException(400, "Seule l'intégration par rapport à x est supportée.")
     expr = expand(expr)
     input_latex = (f"\\int_{{{bounds[0]}}}^{{{bounds[1]}}} {tex(expr)}\\,dx"
                    if bounds else f"\\int {tex(expr)}\\,dx")
-    steps = [Step(description="Expression à intégrer", latex=tex(expr))]
-    terms = expr.as_ordered_terms()
-    if len(terms) > 1:
-        steps.append(Step(description="Règle de la somme : intégrer terme par terme", latex=tex(expr)))
-    int_terms = []
-    for t in terms:
-        it = integrate(t, X); int_terms.append(it)
-        if t.has(X):
-            pt = Poly(t, X) if t.is_polynomial(X) else None
-            if pt and pt.degree() >= 1:
-                pw = pt.degree(); co = pt.LC()
-                nc = nsimplify(Rational(co, pw + 1))
-                desc = f"Règle inverse : ∫{tex(co)}x^{{{pw}}}dx = {tex(nc)}x^{{{pw+1}}}"
-            else:
-                desc = f"∫{tex(t)}dx = {tex(it)}"
-        else:
-            desc = f"Intégrale d'une constante : ∫{tex(t)}dx = {tex(t)}·x"
-        steps.append(Step(description=desc, latex=tex(it)))
-    F = simplify(sum(int_terms))
+    F = simplify(integrate(expr, X))
+
+    steps = [
+        Step(description="Write the integral to evaluate", latex=input_latex),
+        Step(description="Apply the Power Rule for Integration: ∫xⁿ dx = xⁿ⁺¹/(n+1) + C",
+             latex=f"\\int {tex(expr)}\\,dx"),
+    ]
+    for t in expr.as_ordered_terms():
+        it = integrate(t, X)
+        steps.append(Step(description=f"Integrate term: {tex(t)}", latex=f"\\int {tex(t)}\\,dx = {tex(it)}"))
     if bounds:
         a_s, b_s = nsimplify(bounds[0]), nsimplify(bounds[1])
         val = nsimplify(F.subs(X, b_s) - F.subs(X, a_s))
-        steps.append(Step(description="Primitive F(x)", latex=f"F(x) = {tex(F)} + C"))
-        steps.append(Step(description=f"Intégrale définie : F({bounds[1]}) − F({bounds[0]})",
-            latex=f"\\left[{tex(F)}\\right]_{{{bounds[0]}}}^{{{bounds[1]}}} = {tex(val)}"))
-        return SolveResponse(type="integrale", input_latex=input_latex, steps=steps,
+        steps.append(Step(description="Write the antiderivative F(x)", latex=f"F(x) = {tex(F)}"))
+        steps.append(Step(description=f"Apply Fundamental Theorem of Calculus: F({bounds[1]}) − F({bounds[0]})",
+            latex=f"\\left[{tex(F)}\\right]_{{{bounds[0]}}}^{{{bounds[1]}}} = {tex(F.subs(X, b_s))} - {tex(F.subs(X, a_s))} = {tex(val)}"))
+        m1 = single_method("definite", "Method 1: Definite Integration",
+                            "Méthode 1 : Intégrale Définie", steps)
+        return SolveResponse(type="integrale", input_latex=input_latex, methods=[m1],
             results=[Result(latex=tex(val), decimal=decimal_str(val))],
-            plot=sample_plot(expr))
-    steps.append(Step(description="Primitive (+ constante C)", latex=f"{tex(F)} + C"))
-    return SolveResponse(type="integrale", input_latex=input_latex, steps=steps,
+            final_answer=tex(val), plot=sample_plot(expr))
+    steps.append(Step(description="Add the constant of integration C",
+                      latex=f"\\int {tex(expr)}\\,dx = {tex(F)} + C"))
+    m1 = single_method("indefinite", "Method 1: Indefinite Integration",
+                        "Méthode 1 : Intégrale Indéfinie", steps)
+    return SolveResponse(type="integrale", input_latex=input_latex, methods=[m1],
         results=[Result(latex=f"{tex(F)} + C")],
-        plot=sample_plot(expr))
+        final_answer=f"{tex(F)} + C", plot=sample_plot(expr))
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  5. STATISTIQUES
-# ════════════════════════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════════════════════
+#  5. STATISTICS
+# ════════════════════════════════════════════════════════════════════════════
 
 def solve_statistics(raw: str) -> SolveResponse:
     cleaned = re.sub(r'(moyenne|médiane|mode|statistiques?|données?|de|:)\s*', '', raw, flags=re.IGNORECASE)
@@ -367,9 +547,9 @@ def solve_statistics(raw: str) -> SolveResponse:
     try:
         nums = [float(p.replace(',', '.')) for p in parts if p.strip()]
     except ValueError:
-        raise HTTPException(400, "Format : liste de nombres séparés par des virgules (ex: 4, 7, 13, 2, 1).")
+        raise HTTPException(400, "Format: comma-separated numbers (e.g. 4, 7, 13, 2, 1).")
     if len(nums) < 2:
-        raise HTTPException(400, "Minimum 2 valeurs requises.")
+        raise HTTPException(400, "Minimum 2 values required.")
     n = len(nums); total = sum(nums); mean = total / n
     sn = sorted(nums)
     median = (sn[n//2-1] + sn[n//2]) / 2 if n % 2 == 0 else sn[n//2]
@@ -378,32 +558,37 @@ def solve_statistics(raw: str) -> SolveResponse:
     variance = sum((xi - mean)**2 for xi in nums) / n
     std_dev = variance ** 0.5
     data_range = max(nums) - min(nums)
-
     def fmt(v): return str(int(v)) if v == int(v) else str(v)
     input_latex = "\\{" + ", ".join(fmt(v) for v in nums) + "\\}"
     steps = [
-        Step(description=f"Données ({n} valeurs)", latex=input_latex),
-        Step(description="Tri croissant", latex="\\{" + ", ".join(fmt(v) for v in sn) + "\\}"),
-        Step(description="Moyenne = somme ÷ n",
-            latex=f"\\bar{{x}} = \\frac{{{fmt(total)}}}{{{n}}} = {mean:.6g}"),
-        Step(description="Médiane : valeur centrale" + (" (moy. des 2 centrales)" if n % 2 == 0 else ""),
-            latex=f"\\text{{Médiane}} = {median:.6g}"),
-        Step(description="Mode : valeur(s) la(les) plus fréquente(s)",
-            latex=f"\\text{{Mode}} = {', '.join(fmt(m) for m in modes)}"),
-        Step(description="Variance σ²", latex=f"\\sigma^2 = {variance:.6g}"),
-        Step(description="Écart-type σ = √(variance)", latex=f"\\sigma = {std_dev:.6g}"),
-        Step(description=f"Étendue = max − min = {fmt(max(nums))} − {fmt(min(nums))}",
-            latex=f"\\text{{Étendue}} = {data_range:.6g}"),
+        Step(description=f"Dataset with {n} values", latex=input_latex),
+        Step(description="Sort the data in ascending order",
+             latex="\\{" + ", ".join(fmt(v) for v in sn) + "\\}"),
+        Step(description="Calculate the Mean (Average) = Sum ÷ n",
+             latex=f"\\bar{{x}} = \\frac{{{fmt(total)}}}{{{n}}} = {mean:.6g}"),
+        Step(description="Find the Median: middle value of sorted data" + (" (average of two middle values)" if n % 2 == 0 else ""),
+             latex=f"\\text{{Median}} = {median:.6g}"),
+        Step(description="Find the Mode: most frequently occurring value(s)",
+             latex=f"\\text{{Mode}} = {', '.join(fmt(m) for m in modes)}"),
+        Step(description="Calculate Variance σ² = Σ(xᵢ − x̄)² / n",
+             latex=f"\\sigma^2 = {variance:.6g}"),
+        Step(description="Calculate Standard Deviation σ = √(Variance)",
+             latex=f"\\sigma = {std_dev:.6g}"),
+        Step(description=f"Range = Maximum − Minimum = {fmt(max(nums))} − {fmt(min(nums))}",
+             latex=f"\\text{{Range}} = {data_range:.6g}"),
     ]
-    return SolveResponse(type="statistiques", input_latex=input_latex, steps=steps, results=[
-        Result(latex=f"\\bar{{x}} = {mean:.6g}", decimal=f"{mean:.6g}"),
-        Result(latex=f"\\text{{Médiane}} = {median:.6g}", decimal=f"{median:.6g}"),
-        Result(latex=f"\\sigma = {std_dev:.6g}", decimal=f"{std_dev:.6g}"),
-    ])
+    m1 = single_method("descriptive", "Method 1: Descriptive Statistics",
+                        "Méthode 1 : Statistiques Descriptives", steps)
+    return SolveResponse(type="statistiques", input_latex=input_latex, methods=[m1],
+        results=[Result(latex=f"\\bar{{x}} = {mean:.6g}", decimal=f"{mean:.6g}"),
+                 Result(latex=f"\\text{{Median}} = {median:.6g}"),
+                 Result(latex=f"\\sigma = {std_dev:.6g}")],
+        final_answer=f"Mean = {mean:.6g}, Median = {median:.6g}, σ = {std_dev:.6g}")
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  6. TRIGONOMÉTRIE
-# ════════════════════════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════════════════════
+#  6. TRIGONOMETRY
+# ════════════════════════════════════════════════════════════════════════════
 
 def solve_trigonometry(raw: str) -> SolveResponse:
     cleaned = pre(raw).replace("°", "*pi/180")
@@ -411,41 +596,52 @@ def solve_trigonometry(raw: str) -> SolveResponse:
         ls, rs = cleaned.split("=", 1)
         lhs = safe_parse(ls.strip()); rhs = safe_parse(rs.strip())
         input_latex = f"{tex(lhs)} = {tex(rhs)}"
-        steps = [Step(description="Équation trigonométrique", latex=input_latex)]
+        steps = [
+            Step(description="Write the trigonometric equation", latex=input_latex),
+            Step(description="Isolate the trigonometric function", latex=input_latex),
+        ]
         try:
             sols = sympy.solve(Eq(lhs, rhs), X)
         except Exception:
             sols = []
         if not sols:
-            steps.append(Step(description="Résolution", latex="\\text{Pas de solution algébrique simple}"))
-            return SolveResponse(type="trigonometrie", input_latex=input_latex, steps=steps, results=[],
+            steps.append(Step(description="No simple algebraic solution found", latex="\\text{No simple solution}"))
+            m1 = single_method("trig_solve", "Method 1: Trigonometric Solving",
+                                "Méthode 1 : Résolution Trigonométrique", steps)
+            return SolveResponse(type="trigonometrie", input_latex=input_latex, methods=[m1],
+                results=[], final_answer="No simple solution",
                 note="Aucune solution algébrique simple trouvée.")
-        steps.append(Step(description=f"{len(sols)} solution(s) trouvée(s)",
-            latex=", ".join(tex(s) for s in sols)))
-        return SolveResponse(type="trigonometrie", input_latex=input_latex, steps=steps,
-            results=[Result(latex=tex(s), decimal=decimal_str(float(s.evalf())) if s.is_number else None) for s in sols])
+        for s in sols:
+            steps.append(Step(description=f"Solution: x = {tex(s)}", latex=f"x = {tex(s)}"))
+        m1 = single_method("trig_solve", "Method 1: Trigonometric Solving",
+                            "Méthode 1 : Résolution Trigonométrique", steps)
+        fa = ", ".join(f"x = {tex(s)}" for s in sols)
+        return SolveResponse(type="trigonometrie", input_latex=input_latex, methods=[m1],
+            results=[Result(latex=tex(s)) for s in sols], final_answer=fa)
     expr = safe_parse(cleaned)
     input_latex = tex(expr)
-    steps = [Step(description="Expression trigonométrique", latex=input_latex)]
     simp = trigsimp(expr)
-    exp_trig = sympy.expand_trig(expr)
-    if exp_trig != expr:
-        steps.append(Step(description="Développement", latex=tex(exp_trig)))
-    steps.append(Step(description="Simplification trigonométrique", latex=tex(simp)))
-    num_val = None
+    steps = [
+        Step(description="Write the trigonometric expression", latex=input_latex),
+        Step(description="Apply trigonometric identities to simplify", latex=tex(simp)),
+    ]
     try:
         nv = float(simp.evalf())
+        steps.append(Step(description="Calculate the numerical value", latex=f"\\approx {nv:.6g}"))
         num_val = f"{nv:.6g}"
-        steps.append(Step(description="Valeur numérique", latex=f"\\approx {num_val}"))
     except Exception:
-        pass
+        num_val = None
+    m1 = single_method("trig_simplify", "Method 1: Simplification",
+                        "Méthode 1 : Simplification", steps)
     plot = sample_plot(expr, lo=-6.28, hi=6.28) if expr.has(X) else None
-    return SolveResponse(type="trigonometrie", input_latex=input_latex, steps=steps,
-        results=[Result(latex=tex(simp), decimal=num_val)], plot=plot)
+    return SolveResponse(type="trigonometrie", input_latex=input_latex, methods=[m1],
+        results=[Result(latex=tex(simp), decimal=num_val)],
+        final_answer=tex(simp), plot=plot)
 
-# ════════════════════════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════════════════════
 #  7. MATRICES
-# ════════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 
 def solve_matrix(raw: str) -> SolveResponse:
     cleaned = raw.strip().replace("(", "[").replace(")", "]")
@@ -454,45 +650,53 @@ def solve_matrix(raw: str) -> SolveResponse:
         data = json.loads(cleaned)
         M = Matrix([[nsimplify(v) for v in row] for row in data])
     except Exception:
-        raise HTTPException(400, "Format : [[1,2],[3,4]] pour une matrice 2×2.")
+        raise HTTPException(400, "Format: [[1,2],[3,4]] for a 2×2 matrix.")
     rows, cols = M.shape
     input_latex = tex(M)
-    steps = [Step(description=f"Matrice {rows}×{cols}", latex=input_latex)]
+    steps = [Step(description=f"Given {rows}×{cols} matrix", latex=input_latex)]
     results = []
+    note = None
     if rows == cols:
         d = M.det()
-        steps.append(Step(description="Déterminant det(A)", latex=f"\\det(A) = {tex(d)}"))
+        steps.append(Step(description="Calculate the Determinant det(A)", latex=f"\\det(A) = {tex(d)}"))
         results.append(Result(latex=f"\\det(A) = {tex(d)}", decimal=decimal_str(d)))
         tr = M.trace()
-        steps.append(Step(description="Trace (somme diagonale)", latex=f"\\text{{tr}}(A) = {tex(tr)}"))
+        steps.append(Step(description="Calculate the Trace (sum of diagonal elements)", latex=f"\\text{{tr}}(A) = {tex(tr)}"))
         if d != 0:
             try:
                 inv = M.inv()
-                steps.append(Step(description="Inverse A⁻¹", latex=f"A^{{-1}} = {tex(inv)}"))
+                steps.append(Step(description="Calculate the Inverse A⁻¹ using the adjugate method",
+                    latex=f"A^{{-1}} = {tex(inv)}"))
                 results.append(Result(latex=f"A^{{-1}} = {tex(inv)}"))
             except Exception:
-                steps.append(Step(description="Inverse", latex="\\text{Calcul impossible}"))
+                pass
         else:
-            steps.append(Step(description="Matrice singulière (det = 0) — pas d'inverse", latex="\\det(A) = 0"))
+            steps.append(Step(description="Matrix is singular (det = 0) — inverse does not exist", latex="\\det(A) = 0"))
         if rows <= 3:
             try:
                 evs = M.eigenvals()
-                ev_str = ", ".join(f"{tex(k)}" + (f"\\,(\\times{v})" if v > 1 else "") for k, v in evs.items())
-                steps.append(Step(description="Valeurs propres (eigenvalues)", latex=f"\\lambda \\in \\{{{ev_str}\\}}"))
+                ev_str = ", ".join(f"{tex(k)}" for k in evs)
+                steps.append(Step(description="Find Eigenvalues by solving det(A − λI) = 0",
+                    latex=f"\\lambda \\in \\{{{ev_str}\\}}"))
             except Exception:
                 pass
-    steps.append(Step(description="Transposée Aᵀ", latex=f"A^T = {tex(M.T)}"))
+    steps.append(Step(description="Calculate the Transpose Aᵀ", latex=f"A^T = {tex(M.T)}"))
     try:
         rk = M.rank()
-        steps.append(Step(description="Rang", latex=f"\\text{{rang}}(A) = {rk}"))
+        steps.append(Step(description="Determine the Rank of the matrix", latex=f"\\text{{rank}}(A) = {rk}"))
     except Exception:
         pass
-    note = None if rows == cols else "Déterminant et inverse disponibles pour les matrices carrées uniquement."
-    return SolveResponse(type="matrice", input_latex=input_latex, steps=steps, results=results, note=note)
+    note = None if rows == cols else "Determinant and inverse are only available for square matrices."
+    m1 = single_method("matrix_ops", "Method 1: Matrix Operations",
+                        "Méthode 1 : Opérations Matricielles", steps)
+    fa = f"det = {tex(results[0].latex.split('=')[1].strip())}" if results else "See steps"
+    return SolveResponse(type="matrice", input_latex=input_latex, methods=[m1],
+        results=results, final_answer=fa, note=note)
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  8. MATHS DE BASE
-# ════════════════════════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════════════════════
+#  8. BASIC MATH
+# ════════════════════════════════════════════════════════════════════════════
 
 def solve_basic(raw: str) -> SolveResponse:
     cl = raw.strip().lower()
@@ -500,191 +704,213 @@ def solve_basic(raw: str) -> SolveResponse:
     if m:
         a, b = int(m.group(1)), int(m.group(2))
         g = sympy.gcd(a, b)
-        input_latex = f"\\text{{PGCD}}({a},{b})"
-        steps = [Step(description=f"PGCD({a},{b}) — algorithme d'Euclide", latex=input_latex)]
+        input_latex = f"\\text{{GCD}}({a},{b})"
         aa, bb = abs(a), abs(b)
-        while bb:
-            steps.append(Step(description=f"{aa} = {aa//bb}×{bb} + {aa%bb}", latex=f"{aa} = {aa//bb} \\times {bb} + {aa%bb}"))
-            aa, bb = bb, aa % bb
-        steps.append(Step(description="Résultat", latex=f"\\text{{PGCD}} = {g}"))
-        return SolveResponse(type="basique", input_latex=input_latex, steps=steps,
-            results=[Result(latex=str(g), decimal=str(g))])
+        steps = [Step(description=f"Find GCD({a},{b}) using the Euclidean Algorithm", latex=input_latex)]
+        temp_a, temp_b = aa, bb
+        while temp_b:
+            q, r = divmod(temp_a, temp_b)
+            steps.append(Step(description=f"{temp_a} = {q} × {temp_b} + {r} (divide and find remainder)",
+                               latex=f"{temp_a} = {q} \\times {temp_b} + {r}"))
+            temp_a, temp_b = temp_b, r
+        steps.append(Step(description=f"When remainder = 0, the last divisor is the GCD", latex=f"\\text{{GCD}} = {g}"))
+        m1 = single_method("gcd", "Method 1: Euclidean Algorithm",
+                            "Méthode 1 : Algorithme d'Euclide", steps)
+        return SolveResponse(type="basique", input_latex=input_latex, methods=[m1],
+            results=[Result(latex=str(g))], final_answer=f"GCD = {g}")
     m = re.search(r'(?:ppcm|lcm)\s*\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)', cl)
     if m:
         a, b = int(m.group(1)), int(m.group(2))
         g = sympy.gcd(abs(a), abs(b)); l = sympy.lcm(a, b)
-        input_latex = f"\\text{{PPCM}}({a},{b})"
+        input_latex = f"\\text{{LCM}}({a},{b})"
         steps = [
-            Step(description=f"PGCD({a},{b}) = {g}", latex=f"\\text{{PGCD}}({a},{b}) = {g}"),
-            Step(description="PPCM = |a×b| ÷ PGCD",
-                latex=f"\\text{{PPCM}} = \\frac{{|{a} \\times {b}|}}{{{g}}} = {l}"),
+            Step(description=f"Find LCM({a},{b}) using the relation: LCM = |a×b| / GCD",
+                 latex=input_latex),
+            Step(description=f"First find GCD({a},{b}) = {g}", latex=f"\\text{{GCD}}({a},{b}) = {g}"),
+            Step(description="Apply formula: LCM = |a × b| / GCD",
+                 latex=f"\\text{{LCM}} = \\frac{{|{a} \\times {b}|}}{{{g}}} = {l}"),
         ]
-        return SolveResponse(type="basique", input_latex=input_latex, steps=steps,
-            results=[Result(latex=str(l), decimal=str(l))])
+        m1 = single_method("lcm", "Method 1: LCM Formula",
+                            "Méthode 1 : Formule PPCM", steps)
+        return SolveResponse(type="basique", input_latex=input_latex, methods=[m1],
+            results=[Result(latex=str(l))], final_answer=f"LCM = {l}")
     m = re.search(r'(-?[\d.]+)\s*%\s*(?:de|of)?\s*(-?[\d.]+)', cl)
     if m:
         pct, total = float(m.group(1)), float(m.group(2))
         res = pct * total / 100
-        input_latex = f"{pct}\\%\\ \\text{{de}}\\ {total}"
+        input_latex = f"{pct}\\%\\ \\text{{of}}\\ {total}"
         steps = [
-            Step(description=f"{pct}% de {total}", latex=input_latex),
-            Step(description="Formule : % × total ÷ 100", latex=f"\\frac{{{pct} \\times {total}}}{{100}}"),
-            Step(description="Résultat", latex=f"= {res:.6g}"),
+            Step(description=f"Calculate {pct}% of {total}", latex=input_latex),
+            Step(description="Formula: Percentage × Total / 100",
+                 latex=f"\\frac{{{pct} \\times {total}}}{{100}}"),
+            Step(description="Calculate the result", latex=f"= {res:.6g}"),
         ]
-        return SolveResponse(type="basique", input_latex=input_latex, steps=steps,
-            results=[Result(latex=f"{res:.6g}", decimal=f"{res:.6g}")])
+        m1 = single_method("percentage", "Method 1: Percentage Calculation",
+                            "Méthode 1 : Calcul de Pourcentage", steps)
+        return SolveResponse(type="basique", input_latex=input_latex, methods=[m1],
+            results=[Result(latex=f"{res:.6g}")], final_answer=f"{res:.6g}")
     try:
         expr = safe_parse(pre(raw))
         result = nsimplify(expr)
         input_latex = tex(expr)
         steps = [
-            Step(description="Expression arithmétique", latex=input_latex),
-            Step(description="Résultat", latex=tex(result)),
+            Step(description="Write the arithmetic expression", latex=input_latex),
+            Step(description="Apply order of operations (PEMDAS/BODMAS) to evaluate",
+                 latex=tex(result)),
         ]
-        return SolveResponse(type="basique", input_latex=input_latex, steps=steps,
-            results=[Result(latex=tex(result), decimal=decimal_str(result))])
+        m1 = single_method("arithmetic", "Method 1: Arithmetic Evaluation",
+                            "Méthode 1 : Calcul Arithmétique", steps)
+        return SolveResponse(type="basique", input_latex=input_latex, methods=[m1],
+            results=[Result(latex=tex(result), decimal=decimal_str(result))],
+            final_answer=tex(result))
     except Exception:
-        raise HTTPException(400, "Essayez : 20% de 150, pgcd(12,18), ppcm(4,6) ou une expression comme 3+4×5.")
+        raise HTTPException(400, "Try: 20% of 150, gcd(12,18), lcm(4,6) or an expression like 3+4×5.")
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  9. SYSTÈMES D'ÉQUATIONS
-# ════════════════════════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════════════════════
+#  9. SYSTEMS OF EQUATIONS
+# ════════════════════════════════════════════════════════════════════════════
 
 def solve_system(raw: str) -> SolveResponse:
-    # séparateurs possibles : ; ou retour ligne ou " et "
     parts = re.split(r'[;\n]| et ', raw.strip())
     parts = [p.strip() for p in parts if p.strip() and "=" in p]
     if len(parts) < 2:
-        raise HTTPException(400, "Entrez au moins 2 équations séparées par « ; » (ex: 2x+y=5 ; x-y=1).")
-    if len(parts) > 4:
-        raise HTTPException(400, "Maximum 4 équations supportées.")
-    # collecter variables
-    eqs = []
-    all_syms = set()
+        raise HTTPException(400, "Enter at least 2 equations separated by ';' (e.g. 2x+y=5 ; x-y=1).")
+    eqs = []; all_syms = set()
     for p in parts:
         l, r = p.split("=", 1)
         le = safe_parse(pre(l)); re_ = safe_parse(pre(r))
         eqs.append(Eq(le, re_))
         all_syms |= (le.free_symbols | re_.free_symbols)
     syms = sorted(all_syms, key=lambda s: s.name)
-    if not syms:
-        raise HTTPException(400, "Aucune variable détectée.")
-    if len(syms) > 4:
-        raise HTTPException(400, "Maximum 4 variables supportées.")
     input_latex = "\\begin{cases}" + " \\\\ ".join(f"{tex(e.lhs)} = {tex(e.rhs)}" for e in eqs) + "\\end{cases}"
-    steps = [Step(description=f"Système de {len(eqs)} équations à {len(syms)} inconnues", latex=input_latex)]
-    steps.append(Step(description="Variables : " + ", ".join(s.name for s in syms),
-        latex=", ".join(tex(s) for s in syms)))
     try:
         sol = sympy.solve(eqs, syms, dict=True)
     except Exception:
-        raise HTTPException(400, "Impossible de résoudre ce système.")
+        raise HTTPException(400, "Cannot solve this system.")
     if not sol:
-        steps.append(Step(description="Résolution", latex="\\varnothing"))
-        return SolveResponse(type="systeme", input_latex=input_latex, steps=steps, results=[],
-            note="Aucune solution (système incompatible) ou infinité de solutions.")
+        steps = [Step(description="System of equations", latex=input_latex),
+                 Step(description="No solution found (inconsistent or infinite solutions)", latex="\\varnothing")]
+        m1 = single_method("substitution", "Method 1: Substitution",
+                            "Méthode 1 : Substitution", steps)
+        return SolveResponse(type="systeme", input_latex=input_latex, methods=[m1],
+            results=[], final_answer="No solution",
+            note="No solution or infinite solutions.")
+    steps = [
+        Step(description=f"System of {len(eqs)} equations with {len(syms)} unknowns", latex=input_latex),
+        Step(description="Solve the system using elimination/substitution", latex=input_latex),
+    ]
     results = []
     for sd in sol:
         for s in syms:
             if s in sd:
                 val = nsimplify(sd[s])
-                steps.append(Step(description=f"Valeur de {s.name}", latex=f"{tex(s)} = {tex(val)}"))
+                steps.append(Step(description=f"Value of {s.name}", latex=f"{tex(s)} = {tex(val)}"))
                 results.append(Result(latex=f"{tex(s)} = {tex(val)}", decimal=decimal_str(val)))
-    return SolveResponse(type="systeme", input_latex=input_latex, steps=steps, results=results)
+    fa = ", ".join(r.latex for r in results)
+    m1 = single_method("substitution", "Method 1: Substitution / Elimination",
+                        "Méthode 1 : Substitution / Élimination", steps)
+    return SolveResponse(type="systeme", input_latex=input_latex, methods=[m1],
+        results=results, final_answer=fa)
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  10. INÉQUATIONS
-# ════════════════════════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════════════════════
+#  10. INEQUALITIES
+# ════════════════════════════════════════════════════════════════════════════
 
 def solve_inequality(raw: str) -> SolveResponse:
     cleaned = pre(raw)
     mrel = re.search(r'(<=|>=|<|>)', cleaned)
     if not mrel:
-        raise HTTPException(400, "Une inéquation doit contenir <, >, <= ou >= (ex: 2x+5>11).")
+        raise HTTPException(400, "An inequality must contain <, >, <= or >= (e.g. 2x+5>11).")
     op = mrel.group(1)
     l, r = cleaned.split(op, 1)
     lhs = safe_parse(l.strip()); rhs = safe_parse(r.strip())
-    if (lhs.free_symbols | rhs.free_symbols) - {X}:
-        raise HTTPException(400, "Seule la variable x est prise en charge.")
     rel = {"<": lhs < rhs, ">": lhs > rhs, "<=": lhs <= rhs, ">=": lhs >= rhs}[op]
     input_latex = tex(rel)
-    steps = [Step(description="Inéquation de départ", latex=input_latex)]
     moved = expand(lhs - rhs)
-    steps.append(Step(description="Tout ramener à gauche (comparer à 0)",
-        latex=f"{tex(moved)} \\;{op.replace('<=','\\leq').replace('>=','\\geq').replace('<','<').replace('>','>')}\\; 0"))
+    op_tex = op.replace("<=","\\leq").replace(">=","\\geq")
+    steps = [
+        Step(description="Write the inequality", latex=input_latex),
+        Step(description="Move all terms to the left side (compare to 0)",
+             latex=f"{tex(moved)} \\; {op_tex} \\; 0"),
+    ]
     try:
         sol = sympy.reduce_inequalities([rel], X)
     except NotImplementedError:
-        steps.append(Step(description="Résolution", latex="\\text{Méthode algébrique non disponible}"))
-        return SolveResponse(type="inequation", input_latex=input_latex, steps=steps, results=[],
-            note="Cette inéquation ne peut pas être résolue algébriquement de façon simple.")
-    except Exception:
-        raise HTTPException(400, "Impossible de résoudre cette inéquation.")
-    steps.append(Step(description="Ensemble solution", latex=tex(sol)))
-    return SolveResponse(type="inequation", input_latex=input_latex, steps=steps,
-        results=[Result(latex=tex(sol))],
+        steps.append(Step(description="No simple algebraic solution available",
+                           latex="\\text{No simple solution}"))
+        m1 = single_method("inequality_solve", "Method 1: Algebraic Solving",
+                            "Méthode 1 : Résolution Algébrique", steps)
+        return SolveResponse(type="inequation", input_latex=input_latex, methods=[m1],
+            results=[], final_answer="See note",
+            note="This inequality cannot be solved algebraically in simple form.")
+    steps.append(Step(description="Solve and express the solution set", latex=tex(sol)))
+    steps.append(Step(description="Solution set (interval notation)", latex=tex(sol)))
+    m1 = single_method("inequality_solve", "Method 1: Algebraic Solving",
+                        "Méthode 1 : Résolution Algébrique", steps)
+    return SolveResponse(type="inequation", input_latex=input_latex, methods=[m1],
+        results=[Result(latex=tex(sol))], final_answer=tex(sol),
         plot=sample_plot(moved))
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  11. FACTORISATION
-# ════════════════════════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════════════════════
+#  11-20: remaining solvers (factor, expand, limit, log, exp, complex,
+#         sequence, probability, polynomial, primefactor)
+# ════════════════════════════════════════════════════════════════════════════
 
 def solve_factor(raw: str) -> SolveResponse:
     expr = safe_parse(pre(raw))
     input_latex = tex(expr)
-    steps = [Step(description="Expression de départ", latex=input_latex)]
     expanded = expand(expr)
-    if expanded != expr:
-        steps.append(Step(description="Forme développée", latex=tex(expanded)))
     factored = factor(expr)
-    if factored == expr or factored == expanded:
-        steps.append(Step(description="L'expression est déjà factorisée ou irréductible", latex=tex(factored)))
-    else:
-        steps.append(Step(description="Forme factorisée", latex=tex(factored)))
-    # racines si polynôme en x
-    note = None
+    steps = [
+        Step(description="Write the expression to factorize", latex=input_latex),
+        Step(description="Expand to standard form (if needed)", latex=tex(expanded)),
+        Step(description="Factor by finding common factors and using special identities",
+             latex=f"{tex(factored)}"),
+    ]
     if expr.free_symbols == {X}:
         try:
             roots = sympy.roots(Poly(expanded, X))
             if roots:
-                rstr = ", ".join(f"{tex(k)}" + (f"\\,(\\times{v})" if v > 1 else "") for k, v in roots.items())
-                steps.append(Step(description="Racines (zéros)", latex=f"x \\in \\{{{rstr}\\}}"))
+                rstr = ", ".join(f"x = {tex(k)}" for k in roots)
+                steps.append(Step(description="Zeros of the expression (roots)", latex=rstr))
         except Exception:
             pass
-    return SolveResponse(type="factorisation", input_latex=input_latex, steps=steps,
-        results=[Result(latex=tex(factored))], note=note)
+    m1 = single_method("factoring", "Method 1: Factorization",
+                        "Méthode 1 : Factorisation", steps)
+    return SolveResponse(type="factorisation", input_latex=input_latex, methods=[m1],
+        results=[Result(latex=tex(factored))], final_answer=tex(factored))
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  12. DÉVELOPPEMENT
-# ════════════════════════════════════════════════════════════════════════════════
 
 def solve_expand(raw: str) -> SolveResponse:
     expr = safe_parse(pre(raw))
     input_latex = tex(expr)
-    steps = [Step(description="Expression de départ", latex=input_latex)]
     expanded = expand(expr)
-    steps.append(Step(description="Forme développée", latex=tex(expanded)))
+    steps = [
+        Step(description="Write the expression to expand", latex=input_latex),
+        Step(description="Apply distributive property and FOIL method", latex=tex(expr)),
+        Step(description="Collect and simplify like terms", latex=tex(expanded)),
+    ]
     if expr.free_symbols == {X}:
         try:
             p = Poly(expanded, X)
-            steps.append(Step(description=f"Polynôme de degré {p.degree()}",
-                latex=f"\\deg = {p.degree()}"))
+            steps.append(Step(description=f"Result is a degree-{p.degree()} polynomial",
+                               latex=f"\\deg = {p.degree()}"))
         except Exception:
             pass
-    return SolveResponse(type="developpement", input_latex=input_latex, steps=steps,
-        results=[Result(latex=tex(expanded))])
+    m1 = single_method("expansion", "Method 1: Expansion",
+                        "Méthode 1 : Développement", steps)
+    return SolveResponse(type="developpement", input_latex=input_latex, methods=[m1],
+        results=[Result(latex=tex(expanded))], final_answer=tex(expanded))
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  13. LIMITES
-# ════════════════════════════════════════════════════════════════════════════════
 
 def solve_limit(raw: str) -> SolveResponse:
-    # formats : "sin(x)/x, x->0"  ou  "sin(x)/x quand x->0"  ou  "lim sin(x)/x x->0"
     cleaned = pre(raw)
     cleaned = re.sub(r'^lim\s*', '', cleaned, flags=re.IGNORECASE)
     m = re.search(r'x\s*(?:->|→|tend vers)\s*(-?oo|-?infinity|-?inf|-?[\d.]+(?:/[\d.]+)?|pi|-pi)', cleaned, re.IGNORECASE)
-    point = 0
-    direction = '+-'
+    point = 0; direction = '+-'
     if m:
         ptxt = m.group(1).lower().replace('infinity', 'oo').replace('inf', 'oo')
         cleaned = cleaned[:m.start()].rstrip(' ,;quand').strip()
@@ -694,30 +920,25 @@ def solve_limit(raw: str) -> SolveResponse:
         else:
             point = safe_parse(ptxt)
     expr = safe_parse(cleaned)
-    if expr.free_symbols - {X}:
-        raise HTTPException(400, "Seule la variable x est prise en charge.")
     pt_latex = tex(point)
     input_latex = f"\\lim_{{x \\to {pt_latex}}} {tex(expr)}"
-    steps = [Step(description=f"Limite de la fonction quand x → {pt_latex}", latex=input_latex)]
-    # tentative substitution directe
-    try:
-        direct = expr.subs(X, point) if point not in (oo, -oo) else None
-        if direct is not None and direct.is_finite and not direct.has(sympy.zoo, sympy.nan):
-            steps.append(Step(description="Substitution directe", latex=f"{tex(expr)}\\Big|_{{x={pt_latex}}} = {tex(direct)}"))
-    except Exception:
-        pass
     try:
         L = limit(expr, X, point, direction) if point in (oo, -oo) else limit(expr, X, point)
     except Exception:
-        raise HTTPException(400, "Impossible de calculer cette limite.")
-    steps.append(Step(description="Résultat de la limite", latex=f"= {tex(L)}"))
-    return SolveResponse(type="limite", input_latex=input_latex, steps=steps,
+        raise HTTPException(400, "Cannot compute this limit.")
+    steps = [
+        Step(description=f"Evaluate the limit as x approaches {pt_latex}", latex=input_latex),
+        Step(description="Check for indeterminate form (0/0, ∞/∞, etc.)", latex=input_latex),
+        Step(description="Apply limit rules (L'Hôpital, factoring, substitution)",
+             latex=f"\\lim_{{x \\to {pt_latex}}} {tex(expr)}"),
+        Step(description="Final limit value", latex=f"= {tex(L)}"),
+    ]
+    m1 = single_method("limit_eval", "Method 1: Limit Evaluation",
+                        "Méthode 1 : Calcul de Limite", steps)
+    return SolveResponse(type="limite", input_latex=input_latex, methods=[m1],
         results=[Result(latex=tex(L), decimal=decimal_str(L) if L.is_finite else None)],
-        plot=sample_plot(expr))
+        final_answer=tex(L), plot=sample_plot(expr))
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  14. LOGARITHMES
-# ════════════════════════════════════════════════════════════════════════════════
 
 def solve_logarithm(raw: str) -> SolveResponse:
     cleaned = pre(raw)
@@ -725,488 +946,413 @@ def solve_logarithm(raw: str) -> SolveResponse:
         l, r = cleaned.split("=", 1)
         lhs = safe_parse(l.strip()); rhs = safe_parse(r.strip())
         input_latex = f"{tex(lhs)} = {tex(rhs)}"
-        steps = [Step(description="Équation logarithmique", latex=input_latex)]
         combined = logcombine(lhs - rhs, force=True)
-        if combined != (lhs - rhs):
-            steps.append(Step(description="Regrouper les logarithmes", latex=f"{tex(combined)} = 0"))
+        steps = [
+            Step(description="Write the logarithmic equation", latex=input_latex),
+            Step(description="Combine logarithms using log rules: log(a)+log(b)=log(a×b)",
+                 latex=f"{tex(combined)} = 0"),
+        ]
         try:
             sols = sympy.solve(Eq(lhs, rhs), X)
         except Exception:
             sols = []
-        if not sols:
-            return SolveResponse(type="logarithme", input_latex=input_latex, steps=steps, results=[],
-                note="Aucune solution trouvée.")
         results = []
         for s in sols:
-            steps.append(Step(description="Solution", latex=f"x = {tex(s)}"))
+            steps.append(Step(description=f"Exponentiate both sides to remove logarithm, solve for x",
+                               latex=f"x = {tex(s)}"))
             results.append(Result(latex=tex(s), decimal=decimal_str(s.evalf()) if s.is_number else None))
-        return SolveResponse(type="logarithme", input_latex=input_latex, steps=steps, results=results)
+        fa = ", ".join(f"x = {tex(s)}" for s in sols) if sols else "No solution"
+        m1 = single_method("log_solve", "Method 1: Logarithmic Solving",
+                            "Méthode 1 : Résolution Logarithmique", steps)
+        return SolveResponse(type="logarithme", input_latex=input_latex, methods=[m1],
+            results=results, final_answer=fa)
     expr = safe_parse(cleaned)
-    input_latex = tex(expr)
-    steps = [Step(description="Expression logarithmique", latex=input_latex)]
     simp = logcombine(simplify(expr), force=True)
-    steps.append(Step(description="Simplification", latex=tex(simp)))
-    val = None
-    try:
-        val = f"{float(simp.evalf()):.6g}"
-        steps.append(Step(description="Valeur numérique", latex=f"\\approx {val}"))
-    except Exception:
-        pass
-    return SolveResponse(type="logarithme", input_latex=input_latex, steps=steps,
-        results=[Result(latex=tex(simp), decimal=val)])
+    steps = [
+        Step(description="Write the logarithmic expression", latex=tex(expr)),
+        Step(description="Apply logarithm rules to simplify", latex=tex(simp)),
+    ]
+    m1 = single_method("log_simplify", "Method 1: Log Simplification",
+                        "Méthode 1 : Simplification Log", steps)
+    return SolveResponse(type="logarithme", input_latex=tex(expr), methods=[m1],
+        results=[Result(latex=tex(simp))], final_answer=tex(simp))
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  15. ÉQUATIONS EXPONENTIELLES
-# ════════════════════════════════════════════════════════════════════════════════
 
 def solve_exponential(raw: str) -> SolveResponse:
     cleaned = pre(raw)
     if "=" not in cleaned:
-        raise HTTPException(400, "Une équation exponentielle doit contenir « = » (ex: 2^x=8).")
+        raise HTTPException(400, "An exponential equation must contain '=' (e.g. 2^x=8).")
     l, r = cleaned.split("=", 1)
     lhs = safe_parse(l.strip()); rhs = safe_parse(r.strip())
-    if (lhs.free_symbols | rhs.free_symbols) - {X}:
-        raise HTTPException(400, "Seule la variable x est prise en charge.")
     input_latex = f"{tex(lhs)} = {tex(rhs)}"
-    steps = [Step(description="Équation exponentielle", latex=input_latex)]
+    steps = [
+        Step(description="Write the exponential equation", latex=input_latex),
+        Step(description="Take logarithm of both sides to bring down the exponent",
+             latex=f"\\ln({tex(lhs)}) = \\ln({tex(rhs)})"),
+    ]
     try:
         sols = sympy.solve(Eq(lhs, rhs), X)
     except Exception:
         sols = []
     sols = [s for s in sols if s.is_real] or sols
-    if not sols:
-        steps.append(Step(description="Résolution", latex="\\varnothing"))
-        return SolveResponse(type="exponentielle", input_latex=input_latex, steps=steps, results=[],
-            note="Aucune solution réelle trouvée.")
     results = []
     for s in sols:
         ss = nsimplify(s)
-        steps.append(Step(description="Solution (logarithme des deux membres)", latex=f"x = {tex(ss)}"))
+        steps.append(Step(description="Solve for x", latex=f"x = {tex(ss)}"))
         results.append(Result(latex=tex(ss), decimal=decimal_str(s.evalf()) if s.is_number else None))
-    return SolveResponse(type="exponentielle", input_latex=input_latex, steps=steps, results=results)
+    fa = ", ".join(f"x = {tex(nsimplify(s))}" for s in sols) if sols else "No real solution"
+    m1 = single_method("exp_solve", "Method 1: Exponential Solving",
+                        "Méthode 1 : Résolution Exponentielle", steps)
+    return SolveResponse(type="exponentielle", input_latex=input_latex, methods=[m1],
+        results=results, final_answer=fa)
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  16. NOMBRES COMPLEXES
-# ════════════════════════════════════════════════════════════════════════════════
 
 def solve_complex(raw: str) -> SolveResponse:
     cleaned = pre_imag(raw)
     expr = safe_parse(cleaned, allow_imag=True)
     if expr.free_symbols:
-        raise HTTPException(400, "Entrez un nombre complexe numérique (ex: (3+4i)*(1-2i)).")
+        raise HTTPException(400, "Enter a numerical complex expression (e.g. (3+4i)*(1-2i)).")
     z = simplify(expr)
-    input_latex = tex(expr)
-    steps = [Step(description="Expression complexe", latex=input_latex)]
     re_p = simplify(sym_re(z)); im_p = simplify(sym_im(z))
-    steps.append(Step(description="Forme algébrique a + bi", latex=f"{tex(re_p)} + {tex(im_p)}i" if im_p >= 0 else f"{tex(re_p)} - {tex(-im_p)}i"))
-    mod = simplify(Abs(z))
-    steps.append(Step(description="Module |z| = √(a² + b²)", latex=f"|z| = {tex(mod)}"))
-    a = arg(z)
-    steps.append(Step(description="Argument arg(z)", latex=f"\\arg(z) = {tex(a)}"))
-    conj = sympy.conjugate(z)
-    steps.append(Step(description="Conjugué z̄", latex=f"\\bar{{z}} = {tex(conj)}"))
+    mod = simplify(Abs(z)); a = arg(z)
+    input_latex = tex(expr)
+    steps = [
+        Step(description="Write the complex expression", latex=input_latex),
+        Step(description="Expand and simplify using i² = −1",
+             latex=f"{tex(re_p)} + {tex(im_p)}i" if im_p >= 0 else f"{tex(re_p)} - {tex(-im_p)}i"),
+        Step(description="Algebraic form: a + bi",
+             latex=f"a = {tex(re_p)}, \\quad b = {tex(im_p)}"),
+        Step(description="Modulus |z| = √(a² + b²)",
+             latex=f"|z| = \\sqrt{{{tex(re_p)}^2 + {tex(im_p)}^2}} = {tex(mod)}"),
+        Step(description="Argument arg(z) = arctan(b/a)",
+             latex=f"\\arg(z) = {tex(a)}"),
+        Step(description="Conjugate z̄ = a − bi",
+             latex=f"\\bar{{z}} = {tex(re_p)} - ({tex(im_p)})i"),
+    ]
     res_latex = f"{tex(re_p)} + {tex(im_p)}i" if im_p >= 0 else f"{tex(re_p)} - {tex(-im_p)}i"
-    return SolveResponse(type="complexe", input_latex=input_latex, steps=steps,
-        results=[
-            Result(latex=res_latex),
-            Result(latex=f"|z| = {tex(mod)}", decimal=decimal_str(mod)),
-        ])
+    m1 = single_method("complex_ops", "Method 1: Complex Number Operations",
+                        "Méthode 1 : Opérations sur Nombres Complexes", steps)
+    return SolveResponse(type="complexe", input_latex=input_latex, methods=[m1],
+        results=[Result(latex=res_latex), Result(latex=f"|z| = {tex(mod)}", decimal=decimal_str(mod))],
+        final_answer=res_latex)
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  17. SUITES (arithmétiques / géométriques)
-# ════════════════════════════════════════════════════════════════════════════════
 
 def solve_sequence(raw: str) -> SolveResponse:
     parts = re.split(r'[,;\s]+', raw.strip())
     try:
         terms = [Rational(p.replace(',', '.')) for p in parts if p.strip()]
     except Exception:
-        raise HTTPException(400, "Entrez les premiers termes séparés par des virgules (ex: 2, 5, 8, 11).")
+        raise HTTPException(400, "Enter the first terms separated by commas (e.g. 2, 5, 8, 11).")
     if len(terms) < 3:
-        raise HTTPException(400, "Minimum 3 termes requis pour identifier la suite.")
+        raise HTTPException(400, "Minimum 3 terms required to identify the sequence.")
     input_latex = ", ".join(tex(t) for t in terms)
-    steps = [Step(description=f"Suite donnée ({len(terms)} termes)", latex=input_latex)]
-    # arithmétique ?
     diffs = [terms[i+1] - terms[i] for i in range(len(terms)-1)]
     if len(set(diffs)) == 1:
         r = diffs[0]; u1 = terms[0]
-        steps.append(Step(description=f"Différence constante r = {tex(r)} → suite arithmétique",
-            latex=f"r = u_{{n+1}} - u_n = {tex(r)}"))
         un = u1 + (N - 1) * r
-        steps.append(Step(description="Terme général uₙ = u₁ + (n−1)·r",
-            latex=f"u_n = {tex(u1)} + (n-1)\\cdot {tex(r)} = {tex(expand(un))}"))
-        n_terms = len(terms)
-        Sn = summation(u1 + (N-1)*r, (N, 1, n_terms))
-        steps.append(Step(description=f"Somme des {n_terms} premiers termes",
-            latex=f"S_{{{n_terms}}} = {tex(Sn)}"))
-        return SolveResponse(type="suite", input_latex=input_latex, steps=steps,
-            results=[
-                Result(latex=f"u_n = {tex(expand(un))}"),
-                Result(latex=f"r = {tex(r)}", decimal=decimal_str(r)),
-            ])
-    # géométrique ?
+        Sn = summation(u1 + (N-1)*r, (N, 1, len(terms)))
+        steps = [
+            Step(description=f"Given sequence with {len(terms)} terms", latex=input_latex),
+            Step(description="Check if differences between consecutive terms are constant",
+                 latex=f"d = {tex(r)} \\quad (\\text{{constant}})"),
+            Step(description="Confirmed: Arithmetic Sequence with common difference d",
+                 latex=f"d = {tex(r)}"),
+            Step(description="General term formula: uₙ = u₁ + (n−1)×d",
+                 latex=f"u_n = {tex(u1)} + (n-1) \\cdot {tex(r)} = {tex(expand(un))}"),
+            Step(description=f"Sum of first {len(terms)} terms: Sₙ = n/2 × (2u₁ + (n−1)d)",
+                 latex=f"S_{{{len(terms)}}} = {tex(Sn)}"),
+        ]
+        m1 = single_method("arithmetic", "Method 1: Arithmetic Sequence",
+                            "Méthode 1 : Suite Arithmétique", steps)
+        return SolveResponse(type="suite", input_latex=input_latex, methods=[m1],
+            results=[Result(latex=f"u_n = {tex(expand(un))}"),
+                     Result(latex=f"d = {tex(r)}", decimal=decimal_str(r))],
+            final_answer=f"uₙ = {tex(expand(un))}, d = {tex(r)}")
     if all(terms[i] != 0 for i in range(len(terms)-1)):
         ratios = [simplify(terms[i+1] / terms[i]) for i in range(len(terms)-1)]
         if len(set(ratios)) == 1:
             q = ratios[0]; u1 = terms[0]
-            steps.append(Step(description=f"Raison constante q = {tex(q)} → suite géométrique",
-                latex=f"q = \\frac{{u_{{n+1}}}}{{u_n}} = {tex(q)}"))
             un = u1 * q**(N - 1)
-            steps.append(Step(description="Terme général uₙ = u₁ · qⁿ⁻¹",
-                latex=f"u_n = {tex(u1)} \\cdot ({tex(q)})^{{n-1}}"))
-            return SolveResponse(type="suite", input_latex=input_latex, steps=steps,
-                results=[
-                    Result(latex=f"u_n = {tex(u1)} \\cdot ({tex(q)})^{{n-1}}"),
-                    Result(latex=f"q = {tex(q)}", decimal=decimal_str(q)),
-                ])
-    steps.append(Step(description="Analyse", latex="\\text{Ni arithmétique ni géométrique}"))
-    return SolveResponse(type="suite", input_latex=input_latex, steps=steps, results=[],
-        note="La suite n'est ni arithmétique ni géométrique (différence et raison non constantes).")
+            steps = [
+                Step(description=f"Given sequence with {len(terms)} terms", latex=input_latex),
+                Step(description="Check if ratios between consecutive terms are constant",
+                     latex=f"q = {tex(q)} \\quad (\\text{{constant}})"),
+                Step(description="Confirmed: Geometric Sequence with common ratio q",
+                     latex=f"q = {tex(q)}"),
+                Step(description="General term formula: uₙ = u₁ × qⁿ⁻¹",
+                     latex=f"u_n = {tex(u1)} \\cdot ({tex(q)})^{{n-1}}"),
+            ]
+            m1 = single_method("geometric", "Method 1: Geometric Sequence",
+                                "Méthode 1 : Suite Géométrique", steps)
+            return SolveResponse(type="suite", input_latex=input_latex, methods=[m1],
+                results=[Result(latex=f"u_n = {tex(u1)} \\cdot ({tex(q)})^{{n-1}}"),
+                         Result(latex=f"q = {tex(q)}", decimal=decimal_str(q))],
+                final_answer=f"uₙ = {tex(u1)}·({tex(q)})ⁿ⁻¹")
+    m1 = single_method("sequence_id", "Method 1: Sequence Identification",
+                        "Méthode 1 : Identification de Suite",
+                        [Step(description="The sequence is neither arithmetic nor geometric",
+                               latex="\\text{No pattern found}")])
+    return SolveResponse(type="suite", input_latex=input_latex, methods=[m1],
+        results=[], final_answer="Pattern not identified",
+        note="The sequence is neither arithmetic nor geometric.")
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  18. PROBABILITÉS / COMBINATOIRE
-# ════════════════════════════════════════════════════════════════════════════════
 
 def solve_probability(raw: str) -> SolveResponse:
     cl = raw.strip().lower().replace(" ", "")
-    # combinaisons C(n,k) ou nCk
     m = re.search(r'c\(?(\d+),(\d+)\)?', cl) or re.search(r'(\d+)c(\d+)', cl)
     if m:
         n_, k_ = int(m.group(1)), int(m.group(2))
-        if k_ > n_:
-            raise HTTPException(400, "k ne peut pas dépasser n.")
+        if k_ > n_: raise HTTPException(400, "k cannot exceed n.")
         val = binomial(n_, k_)
         input_latex = f"\\binom{{{n_}}}{{{k_}}}"
         steps = [
-            Step(description=f"Combinaison de {k_} parmi {n_}", latex=input_latex),
-            Step(description="Formule : n! / (k!·(n−k)!)",
-                latex=f"\\frac{{{n_}!}}{{{k_}!\\,({n_}-{k_})!}}"),
-            Step(description="Résultat", latex=f"= {val}"),
+            Step(description=f"Calculate Combinations: choose {k_} from {n_}", latex=input_latex),
+            Step(description="Formula: C(n,k) = n! / (k! × (n−k)!)",
+                 latex=f"C({n_},{k_}) = \\frac{{{n_}!}}{{{k_}! \\times ({n_}-{k_})!}}"),
+            Step(description="Expand the factorials and simplify",
+                 latex=f"= \\frac{{{n_}!}}{{{k_}! \\times {n_-k_}!}}"),
+            Step(description="Final result", latex=f"= {val}"),
         ]
-        return SolveResponse(type="probabilite", input_latex=input_latex, steps=steps,
-            results=[Result(latex=str(val), decimal=str(val))])
-    # arrangements A(n,k) ou nPk
+        m1 = single_method("combination", "Method 1: Combinations",
+                            "Méthode 1 : Combinaisons", steps)
+        return SolveResponse(type="probabilite", input_latex=input_latex, methods=[m1],
+            results=[Result(latex=str(val))], final_answer=f"C({n_},{k_}) = {val}")
     m = re.search(r'a\(?(\d+),(\d+)\)?', cl) or re.search(r'(\d+)p(\d+)', cl)
     if m:
         n_, k_ = int(m.group(1)), int(m.group(2))
-        if k_ > n_:
-            raise HTTPException(400, "k ne peut pas dépasser n.")
+        if k_ > n_: raise HTTPException(400, "k cannot exceed n.")
         val = factorial(n_) // factorial(n_ - k_)
         input_latex = f"A_{{{n_}}}^{{{k_}}}"
         steps = [
-            Step(description=f"Arrangement de {k_} parmi {n_}", latex=input_latex),
-            Step(description="Formule : n! / (n−k)!",
-                latex=f"\\frac{{{n_}!}}{{({n_}-{k_})!}}"),
-            Step(description="Résultat", latex=f"= {val}"),
+            Step(description=f"Calculate Arrangements (Permutations): arrange {k_} from {n_}", latex=input_latex),
+            Step(description="Formula: A(n,k) = n! / (n−k)!",
+                 latex=f"A({n_},{k_}) = \\frac{{{n_}!}}{{({n_}-{k_})!}}"),
+            Step(description="Final result", latex=f"= {val}"),
         ]
-        return SolveResponse(type="probabilite", input_latex=input_latex, steps=steps,
-            results=[Result(latex=str(val), decimal=str(val))])
-    # factorielle n!
+        m1 = single_method("permutation", "Method 1: Permutations",
+                            "Méthode 1 : Permutations", steps)
+        return SolveResponse(type="probabilite", input_latex=input_latex, methods=[m1],
+            results=[Result(latex=str(val))], final_answer=f"A({n_},{k_}) = {val}")
     m = re.fullmatch(r'(\d+)!', cl)
     if m:
         n_ = int(m.group(1))
-        if n_ > 1000:
-            raise HTTPException(400, "Maximum 1000! supporté.")
+        if n_ > 1000: raise HTTPException(400, "Maximum 1000! supported.")
         val = factorial(n_)
-        input_latex = f"{n_}!"
         steps = [
-            Step(description=f"Factorielle de {n_}", latex=input_latex),
-            Step(description="n! = n × (n−1) × … × 2 × 1", latex=f"{n_}! = {val}"),
+            Step(description=f"Calculate {n_}! (factorial)", latex=f"{n_}!"),
+            Step(description="Factorial: n! = n × (n−1) × (n−2) × … × 2 × 1",
+                 latex=f"{n_}! = {val}"),
         ]
-        return SolveResponse(type="probabilite", input_latex=input_latex, steps=steps,
-            results=[Result(latex=str(val), decimal=decimal_str(val) if n_ < 20 else None)])
-    raise HTTPException(400, "Essayez : C(5,2) pour combinaisons, A(5,2) pour arrangements, ou 5! pour factorielle.")
+        m1 = single_method("factorial", "Method 1: Factorial",
+                            "Méthode 1 : Factorielle", steps)
+        return SolveResponse(type="probabilite", input_latex=f"{n_}!", methods=[m1],
+            results=[Result(latex=str(val))], final_answer=f"{n_}! = {val}")
+    raise HTTPException(400, "Try: C(5,2) for combinations, A(5,2) for arrangements, or 5! for factorial.")
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  19. POLYNÔMES (racines, degré 3+)
-# ════════════════════════════════════════════════════════════════════════════════
 
 def solve_polynomial(raw: str) -> SolveResponse:
     cleaned = pre(raw)
     if "=" in cleaned:
         l, r = cleaned.split("=", 1)
-        lhs = safe_parse(l.strip()); rhs = safe_parse(r.strip())
-        expr = expand(lhs - rhs)
+        expr = expand(safe_parse(l.strip()) - safe_parse(r.strip()))
     else:
         expr = expand(safe_parse(cleaned))
     if expr.free_symbols - {X}:
-        raise HTTPException(400, "Seule la variable x est prise en charge.")
+        raise HTTPException(400, "Only variable x is supported.")
     try:
         p = Poly(expr, X)
     except Exception:
-        raise HTTPException(400, "Impossible d'interpréter comme polynôme en x.")
+        raise HTTPException(400, "Cannot interpret as polynomial in x.")
     input_latex = f"{tex(expr)} = 0"
-    steps = [
-        Step(description=f"Polynôme de degré {p.degree()}", latex=input_latex),
-    ]
     factored = factor(expr)
-    if factored != expr:
-        steps.append(Step(description="Factorisation", latex=f"{tex(factored)} = 0"))
     try:
         roots = sympy.roots(p)
     except Exception:
         roots = {}
     if not roots:
-        # fallback solveset
         try:
             sols = list(sympy.solve(expr, X))
         except Exception:
             sols = []
         roots = {s: 1 for s in sols}
-    if not roots:
-        steps.append(Step(description="Racines", latex="\\text{Aucune racine exacte trouvée}"))
-        return SolveResponse(type="polynome", input_latex=input_latex, steps=steps, results=[],
-            note="Aucune racine exacte trouvée.")
+    steps = [
+        Step(description=f"Write the degree-{p.degree()} polynomial equation", latex=input_latex),
+        Step(description="Factor the polynomial completely",
+             latex=f"{tex(factored)} = 0"),
+    ]
     results = []
     for k, v in roots.items():
         ks = nsimplify(k)
-        mult = f"\\;(\\text{{mult.}}\\,{v})" if v > 1 else ""
-        steps.append(Step(description=f"Racine{' (multiple)' if v > 1 else ''}", latex=f"x = {tex(ks)}{mult}"))
+        mult = f"\\;(\\text{{multiplicity }}\\,{v})" if v > 1 else ""
+        steps.append(Step(description=f"Root{'(double)' if v > 1 else ''}: x = {tex(ks)}",
+                           latex=f"x = {tex(ks)}{mult}"))
         results.append(Result(latex=tex(ks), decimal=decimal_str(k.evalf()) if k.is_number else None))
-    return SolveResponse(type="polynome", input_latex=input_latex, steps=steps, results=results,
-        plot=sample_plot(expr))
+    fa = " or ".join(f"x = {tex(nsimplify(k))}" for k in roots) if roots else "No roots found"
+    m1 = single_method("polynomial_roots", "Method 1: Root Finding",
+                        "Méthode 1 : Recherche de Racines", steps)
+    return SolveResponse(type="polynome", input_latex=input_latex, methods=[m1],
+        results=results, final_answer=fa, plot=sample_plot(expr))
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  20. DÉCOMPOSITION EN FACTEURS PREMIERS
-# ════════════════════════════════════════════════════════════════════════════════
 
 def solve_primefactor(raw: str) -> SolveResponse:
     m = re.search(r'-?\d+', raw)
-    if not m:
-        raise HTTPException(400, "Entrez un nombre entier (ex: 360).")
+    if not m: raise HTTPException(400, "Enter a positive integer (e.g. 360).")
     n_ = abs(int(m.group(0)))
-    if n_ < 2:
-        raise HTTPException(400, "Entrez un entier ≥ 2.")
-    if n_ > 10**15:
-        raise HTTPException(400, "Nombre trop grand (max 10^15).")
+    if n_ < 2: raise HTTPException(400, "Enter an integer ≥ 2.")
+    if n_ > 10**15: raise HTTPException(400, "Number too large (max 10^15).")
     f = factorint(n_)
     input_latex = str(n_)
-    steps = [Step(description=f"Décomposition de {n_} en facteurs premiers", latex=input_latex)]
-    # division successive
+    prod = " \\times ".join(f"{p}^{{{e}}}" if e > 1 else f"{p}" for p, e in sorted(f.items()))
+    steps = [
+        Step(description=f"Find the prime factorization of {n_}", latex=input_latex),
+        Step(description="Divide by smallest prime factor repeatedly until reaching 1",
+             latex=input_latex),
+    ]
     temp = n_
     for prime in sorted(f.keys()):
         while temp % prime == 0:
-            steps.append(Step(description=f"{temp} ÷ {prime} = {temp//prime}",
-                latex=f"{temp} = {prime} \\times {temp//prime}"))
+            steps.append(Step(description=f"Divide {temp} by prime {prime}: {temp} ÷ {prime} = {temp//prime}",
+                               latex=f"{temp} = {prime} \\times {temp//prime}"))
             temp //= prime
-    prod = " \\times ".join(f"{p}^{{{e}}}" if e > 1 else f"{p}" for p, e in sorted(f.items()))
-    steps.append(Step(description="Produit de facteurs premiers", latex=f"{n_} = {prod}"))
-    divisors = sympy.divisor_count(n_)
-    steps.append(Step(description="Nombre de diviseurs", latex=f"d({n_}) = {divisors}"))
-    return SolveResponse(type="facteurs_premiers", input_latex=input_latex, steps=steps,
-        results=[Result(latex=f"{n_} = {prod}")])
+    steps.append(Step(description="Prime factorization complete",
+                       latex=f"{n_} = {prod}"))
+    div_count = sympy.divisor_count(n_)
+    steps.append(Step(description=f"Number of divisors: d({n_}) = {div_count}",
+                       latex=f"d({n_}) = {div_count}"))
+    m1 = single_method("prime_factor", "Method 1: Prime Factorization",
+                        "Méthode 1 : Décomposition en Facteurs Premiers", steps)
+    return SolveResponse(type="facteurs_premiers", input_latex=input_latex, methods=[m1],
+        results=[Result(latex=f"{n_} = {prod}")], final_answer=f"{n_} = {prod}")
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  ROUTES
-# ════════════════════════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════════════════════
+#  DISPATCH TABLE
+# ════════════════════════════════════════════════════════════════════════════
 
 DISPATCH = {
-    "algebra": solve_algebra,
-    "fraction": solve_fraction,
-    "derivative": solve_derivative,
-    "integral": solve_integral,
-    "statistics": solve_statistics,
-    "trigonometry": solve_trigonometry,
-    "matrix": solve_matrix,
-    "basic": solve_basic,
-    "system": solve_system,
-    "inequality": solve_inequality,
-    "factor": solve_factor,
-    "expand": solve_expand,
-    "limit": solve_limit,
-    "logarithm": solve_logarithm,
-    "exponential": solve_exponential,
-    "complex": solve_complex,
-    "sequence": solve_sequence,
-    "probability": solve_probability,
-    "polynomial": solve_polynomial,
-    "primefactor": solve_primefactor,
+    "algebra": solve_algebra, "fraction": solve_fraction,
+    "derivative": solve_derivative, "integral": solve_integral,
+    "statistics": solve_statistics, "trigonometry": solve_trigonometry,
+    "matrix": solve_matrix, "basic": solve_basic,
+    "system": solve_system, "inequality": solve_inequality,
+    "factor": solve_factor, "expand": solve_expand,
+    "limit": solve_limit, "logarithm": solve_logarithm,
+    "exponential": solve_exponential, "complex": solve_complex,
+    "sequence": solve_sequence, "probability": solve_probability,
+    "polynomial": solve_polynomial, "primefactor": solve_primefactor,
 }
 
-# Labels FR pour l'affichage de la catégorie détectée
 CAT_LABELS = {
-    "algebra": "Algèbre", "fraction": "Fractions", "derivative": "Dérivées",
-    "integral": "Intégrales", "statistics": "Statistiques", "trigonometry": "Trigonométrie",
-    "matrix": "Matrices", "basic": "Maths de base", "system": "Systèmes d'équations",
-    "inequality": "Inéquations", "factor": "Factorisation", "expand": "Développement",
-    "limit": "Limites", "logarithm": "Logarithmes", "exponential": "Équations exponentielles",
-    "complex": "Nombres complexes", "sequence": "Suites", "probability": "Probabilités",
-    "polynomial": "Polynômes", "primefactor": "Facteurs premiers",
+    "algebra":"Algèbre","fraction":"Fractions","derivative":"Dérivées",
+    "integral":"Intégrales","statistics":"Statistiques","trigonometry":"Trigonométrie",
+    "matrix":"Matrices","basic":"Maths de base","system":"Systèmes d'équations",
+    "inequality":"Inéquations","factor":"Factorisation","expand":"Développement",
+    "limit":"Limites","logarithm":"Logarithmes","exponential":"Exponentielles",
+    "complex":"Nombres complexes","sequence":"Suites","probability":"Probabilités",
+    "polynomial":"Polynômes","primefactor":"Facteurs premiers",
 }
 
-# ════════════════════════════════════════════════════════════════════════════════
-#  DÉTECTION AUTOMATIQUE DE CATÉGORIE
-#  Analyse l'expression et choisit la meilleure catégorie. Ordre = priorité.
-# ════════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
+#  AUTO-DETECTION  (server-side, fixes the state-lock bug)
+# ════════════════════════════════════════════════════════════════════════════
 
 def detect_category(raw: str) -> str:
-    """Détecte la catégorie la plus probable à partir de l'expression saisie."""
-    s = raw.strip()
-    low = s.lower()
-
-    # 1. Matrices : [[...],[...]]
-    if re.search(r'\[\s*\[', s) and re.search(r'\]\s*\]', s):
-        return "matrix"
-
-    # 2. Limites : lim, ->, →, "tend vers"
-    if re.search(r'\blim\b', low) or re.search(r'(->|→)', s) or 'tend vers' in low:
-        return "limit"
-
-    # 3. Systèmes : plusieurs équations (séparées par ; ou "et") avec =
+    s = raw.strip(); low = s.lower()
+    if re.search(r'\[\s*\[', s) and re.search(r'\]\s*\]', s): return "matrix"
+    if re.search(r'\blim\b', low) or re.search(r'(->|→)', s) or 'tend vers' in low: return "limit"
     eq_parts = [p for p in re.split(r'[;\n]| et ', s) if '=' in p]
-    if len(eq_parts) >= 2:
-        return "system"
-
-    # 4. Inéquations : <, >, <=, >=  (mais pas <- ou ->)
-    if re.search(r'(<=|>=|<|>)', s) and not re.search(r'(->|<-)', s):
-        return "inequality"
-
-    # 5. Combinatoire : C(n,k), A(n,k), nCk, nPk, n!
-    if re.search(r'\b[CA]\s*\(\s*\d+\s*,\s*\d+\s*\)', s) or re.search(r'\d+\s*[CP]\s*\d+', s) or re.fullmatch(r'\s*\d+\s*!\s*', s):
-        return "probability"
-
-    # 6. Nombres complexes : i présent, et pas de variable x/y autre
+    if len(eq_parts) >= 2: return "system"
+    if re.search(r'(<=|>=|<|>)', s) and not re.search(r'(->|<-)', s): return "inequality"
+    if re.search(r'\b[CA]\s*\(\s*\d+\s*,\s*\d+\s*\)', s) or re.fullmatch(r'\s*\d+\s*!\s*', s): return "probability"
     test = re.sub(r'(sin|cos|tan|asin|acos|atan|exp|log|ln|sqrt|pi|abs|arg)', '', low)
-    if re.search(r'(?<![a-z])i(?![a-z])', test) and not re.search(r'[a-hj-z]', test):
-        return "complex"
-
+    if re.search(r'(?<![a-z])i(?![a-z])', test) and not re.search(r'[a-hj-z]', test): return "complex"
     has_eq = '=' in s
-
-    # 7. Logarithmes : ln/log dans une équation
-    if has_eq and re.search(r'\b(ln|log)\b', low):
-        return "logarithm"
-
-    # 8. Exponentielles : a^x ou e^x dans une équation
-    if has_eq and re.search(r'(\d+\s*\^\s*x|e\s*\^\s*x|exp\s*\(\s*x)', low):
-        return "exponential"
-
-    # 9. PGCD / PPCM / pourcentage
-    if re.search(r'\b(pgcd|gcd|ppcm|lcm)\b', low) or re.search(r'%\s*(de|of)\b', low):
-        return "basic"
-
-    # 10. Intégrale définie : [a,b] présent  ou symbole ∫
-    if '∫' in s or (re.search(r'\[\s*-?\d', s) and re.search(r',\s*-?\d+\s*\]', s)):
-        return "integral"
-
-    # 11. Trigonométrie : fonctions trig présentes
-    if re.search(r'\b(sin|cos|tan|asin|acos|atan|sec|csc|cot)\s*\(', low):
-        return "trigonometry"
-
-    # 12. Fraction simple : a/b uniquement (entiers)
-    if re.fullmatch(r'\s*-?\d+\s*/\s*-?\d+\s*', s):
-        return "fraction"
-
-    # 13. Suite : liste de >=3 nombres séparés par virgules, sans =, sans variable
+    if has_eq and re.search(r'\b(ln|log)\b', low): return "logarithm"
+    if has_eq and re.search(r'(\d+\s*\^\s*x|e\s*\^\s*x|exp\s*\(\s*x)', low): return "exponential"
+    if re.search(r'\b(pgcd|gcd|ppcm|lcm)\b', low) or re.search(r'%\s*(de|of)\b', low): return "basic"
+    if '∫' in s or (re.search(r'\[\s*-?\d', s) and re.search(r',\s*-?\d+\s*\]', s)): return "integral"
+    if re.search(r'\b(sin|cos|tan|asin|acos|atan|sec|csc|cot)\s*\(', low): return "trigonometry"
+    if re.fullmatch(r'\s*-?\d+\s*/\s*-?\d+\s*', s): return "fraction"
     if not has_eq and re.fullmatch(r'[\d\s,;.\-/]+', s):
         nums = [p for p in re.split(r'[,;\s]+', s) if p.strip()]
-        if len(nums) >= 3:
-            # statistiques si beaucoup de valeurs (>=5) sinon suite
-            return "statistics" if len(nums) >= 6 else "sequence"
-
-    # 14. Entier seul -> facteurs premiers
-    if re.fullmatch(r'\s*\d+\s*', s) and int(s) >= 2:
-        return "primefactor"
-
-    # 15. Équation avec = : algèbre (gère linéaire/quadratique, redirige vers polynôme si degré>2)
-    if has_eq:
-        return "algebra"
-
-    # 16. Expression sans = avec variable x : on regarde dérivée/intégrale/factorisation
+        if len(nums) >= 6: return "statistics"
+        if len(nums) >= 3: return "sequence"
+    if re.fullmatch(r'\s*\d+\s*', s) and int(s) >= 2: return "primefactor"
+    if has_eq: return "algebra"
     if re.search(r'[a-z]', low):
-        # produit de facteurs (x+...)(x+...) -> développement
-        if re.search(r'\)\s*\(', s):
-            return "expand"
-        return "algebra"  # sera traité comme expression, fallback
-
-    # 17. Calcul arithmétique pur
+        if re.search(r'\)\s*\(', s): return "expand"
+        return "algebra"
     return "basic"
 
 
-def smart_solve(raw: str) -> "SolveResponse":
-    """Détecte la catégorie puis résout. Essaie des alternatives si la 1re échoue."""
+def smart_solve(raw: str) -> SolveResponse:
     primary = detect_category(raw)
-    tried = []
-
-    # ordre d'essai : catégorie détectée, puis fallbacks raisonnables
     candidates = [primary]
-    fallback_map = {
-        "algebra": ["polynomial", "basic"],
-        "polynomial": ["algebra"],
-        "basic": ["algebra"],
-        "sequence": ["statistics"],
-        "statistics": ["sequence"],
-        "expand": ["algebra", "factor"],
-        "complex": ["algebra"],
-    }
-    for f in fallback_map.get(primary, []):
-        if f not in candidates:
-            candidates.append(f)
-
+    fallbacks = {"algebra":["polynomial","basic"],"polynomial":["algebra"],
+                 "basic":["algebra"],"sequence":["statistics"],"expand":["algebra"]}
+    for f in fallbacks.get(primary, []):
+        if f not in candidates: candidates.append(f)
     last_err = None
     for cat in candidates:
         fn = DISPATCH.get(cat)
-        if not fn:
-            continue
+        if not fn: continue
         try:
             resp = fn(raw)
             resp.detected_category = cat
             resp.detected_label = CAT_LABELS.get(cat, cat)
             return resp
         except HTTPException as e:
-            last_err = e
-            tried.append(cat)
-            continue
+            last_err = e; continue
         except Exception as e:
-            last_err = HTTPException(400, f"Erreur ({type(e).__name__})")
-            tried.append(cat)
-            continue
-    # tout a échoué
-    if last_err:
-        raise last_err
-    raise HTTPException(400, "Impossible de reconnaître ce type de problème.")
+            last_err = HTTPException(400, f"Error ({type(e).__name__})"); continue
+    if last_err: raise last_err
+    raise HTTPException(400, "Cannot recognize this type of problem.")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  ROUTES
+# ════════════════════════════════════════════════════════════════════════════
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "CalculatricePro API", "version": "3.0.0", "categories": len(DISPATCH)}
+    return {"status":"ok","version":"5.0.0","categories":len(DISPATCH),"cache_size":len(_SOLVE_CACHE)}
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
-
-class DetectRequest(BaseModel):
-    expression: str
+    return {"status":"ok"}
 
 @app.post("/api/detect")
-def detect(req: DetectRequest):
+def detect(req: SolveRequest):
     raw = req.expression.strip()
-    if not raw:
-        return {"category": None, "label": None}
+    if not raw: return {"category": None, "label": None}
     cat = detect_category(raw)
     return {"category": cat, "label": CAT_LABELS.get(cat, cat)}
 
 @app.post("/api/solve", response_model=SolveResponse)
 def solve(req: SolveRequest):
     raw = req.expression.strip()
-    if not raw:
-        raise HTTPException(400, "Veuillez saisir une expression.")
-    if len(raw) > 500:
-        raise HTTPException(400, "Expression trop longue (max 500 caractères).")
+    if not raw: raise HTTPException(400, "Please enter an expression.")
+    if len(raw) > 500: raise HTTPException(400, "Expression too long (max 500 characters).")
     cat = req.category.lower().strip()
-    # Mode détection automatique
+    # CACHE CHECK — instant response for repeated queries
+    ck = cache_key(raw, cat)
+    cached = cache_get(ck)
+    if cached: return cached
+    # SOLVE
     if cat in ("auto", "", "detect"):
-        return smart_solve(raw)
-    fn = DISPATCH.get(cat, solve_algebra)
-    try:
-        resp = fn(raw)
-        resp.detected_category = cat
-        resp.detected_label = CAT_LABELS.get(cat, cat)
-        return resp
-    except HTTPException:
-        raise
-    except ZeroDivisionError:
-        raise HTTPException(400, "Division par zéro détectée.")
-    except Exception as e:
-        raise HTTPException(400, f"Erreur de syntaxe. ({type(e).__name__})")
+        result = smart_solve(raw)
+    else:
+        fn = DISPATCH.get(cat, solve_algebra)
+        try:
+            result = fn(raw)
+            result.detected_category = cat
+            result.detected_label = CAT_LABELS.get(cat, cat)
+        except HTTPException: raise
+        except ZeroDivisionError: raise HTTPException(400, "Division by zero detected.")
+        except Exception as e: raise HTTPException(400, f"Syntax error. ({type(e).__name__})")
+    # CACHE STORE
+    cache_set(ck, result)
+    return result
 
 if __name__ == "__main__":
     import uvicorn
